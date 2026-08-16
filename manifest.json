@@ -1,0 +1,127 @@
+{
+    "id": "cmspro.localservice",
+    "name": "本地服务",
+    "description": "CmsPro 本地系统服务，提供浏览器自动化、进程管理、文件操作等系统级能力",
+    "version": "1.0.1",
+    "author": "CmsPro",
+    "require": {
+        "php": ">=8.1",
+        "cmspro": ">=5.0.0"
+    },
+    "providers": [
+        "ServiceProvider"
+    ],
+    "install": "Install",
+    "menus": [
+        {
+            "title": "本地服务",
+            "icon": "fa fa-server",
+            "path": "/admin/cmspro/localservice/dashboards",
+            "code": "admin_cmspro_localservice_groups",
+            "order": 100,
+            "children": [
+                {
+                    "title": "仪表盘",
+                    "icon": "fa fa-dashboard",
+                    "path": "/admin/cmspro/localservice/dashboard",
+                    "code": "admin_cmspro_localservice_dashboard",
+                    "order": 1
+                },
+                {
+                    "title": "任务记录",
+                    "icon": "fa fa-tasks",
+                    "path": "/admin/cmspro/localservice/tasks",
+                    "code": "admin_cmspro_localservice_tasks",
+                    "order": 2
+                },
+                {
+                    "title": "日志查看",
+                    "icon": "fa fa-file-text-o",
+                    "path": "/admin/cmspro/localservice/logs",
+                    "code": "admin_cmspro_localservice_logs",
+                    "order": 3
+                },
+                {
+                    "title": "拓展管理",
+                    "icon": "fa fa-cubes",
+                    "path": "/admin/cmspro/localservice/extensions",
+                    "code": "admin_cmspro_localservice_extensions",
+                    "order": 4
+                },
+                {
+                    "title": "指令管理",
+                    "icon": "fa fa-code",
+                    "path": "/admin/cmspro/localservice/scripts",
+                    "code": "admin_cmspro_localservice_scripts",
+                    "order": 5
+                },
+                {
+                    "title": "基本配置",
+                    "icon": "fa fa-cog",
+                    "path": "/admin/cmspro/localservice/settings",
+                    "code": "admin_cmspro_localservice_settings",
+                    "order": 6
+                }
+            ]
+        }
+    ],
+    "config_groups": [
+        {
+            "name": "service_settings",
+            "title": "服务设置",
+            "items": [
+                {
+                    "name": "port",
+                    "title": "监听端口",
+                    "type": "number",
+                    "value": "9501",
+                    "tips": "本地服务监听端口"
+                },
+                {
+                    "name": "auth_token",
+                    "title": "认证Token",
+                    "type": "password",
+                    "value": "",
+                    "tips": "自动生成，留空安装时自动生成"
+                },
+                {
+                    "name": "log_level",
+                    "title": "日志级别",
+                    "type": "select",
+                    "value": "info",
+                    "options": [
+                        {
+                            "label": "Debug",
+                            "value": "debug"
+                        },
+                        {
+                            "label": "Info",
+                            "value": "info"
+                        },
+                        {
+                            "label": "Warn",
+                            "value": "warn"
+                        },
+                        {
+                            "label": "Error",
+                            "value": "error"
+                        }
+                    ]
+                },
+                {
+                    "name": "log_retention_days",
+                    "title": "日志保留天数",
+                    "type": "number",
+                    "value": "30",
+                    "tips": "超过天数的任务/日志自动清理"
+                }
+            ]
+        }
+    ],
+    "permissions": [
+        {
+            "code": "cmspro.localservice.manage",
+            "name": "本地服务管理"
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+{
+    "port": "9501",
+    "auth_token": "UzlDuaSOcCOxlU60cLUFYUG3553tSFVu",
+    "log_level": "debug",
+    "log_retention_days": 30,
+    "open_api_enabled": false,
+    "open_api_key": "",
+    "timezone": "Asia/Shanghai"
+}

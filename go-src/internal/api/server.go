@@ -1,0 +1,83 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+
+	"cmspro-local-service/internal/config"
+)
+
+// Server HTTP 服务器封装
+type Server struct {
+	httpServer *http.Server
+	handler    *Handlers
+}
+
+// NewServer 创建 HTTP 服务器并注册路由
+func NewServer(handlers *Handlers) *Server {
+	mux := http.NewServeMux()
+
+	// 内部 API 路由（Bearer Token 认证）
+	mux.HandleFunc("/api/status", handlers.Status)
+	mux.HandleFunc("/api/task", handlers.CreateTask)
+	mux.HandleFunc("/api/tasks", handlers.ListTasks)
+	mux.HandleFunc("/api/logs", handlers.ListLogs)
+	mux.HandleFunc("/api/logs/clear", handlers.ClearLogs)
+	mux.HandleFunc("/api/tasks/clear", handlers.ClearTasks)
+	mux.HandleFunc("/api/extensions", handlers.ListExtensions)
+	mux.HandleFunc("/api/task/", handlers.TaskDetail)
+	mux.HandleFunc("/api/extensions/", handlers.ExtensionDetail)
+
+	// 开放 API 路由（X-API-Key 认证）
+	// 供第三方跨服务器调用，仅暴露任务执行能力
+	openMux := http.NewServeMux()
+	openMux.HandleFunc("/api/open/task", handlers.CreateTask)
+	openMux.HandleFunc("/api/open/tasks", handlers.ListTasks)
+	openMux.HandleFunc("/api/open/task/", handlers.TaskDetail)
+	openMux.HandleFunc("/api/open/status", handlers.Status)
+	openAPIHandler := OpenAPIAuthMiddleware(openMux)
+
+	// 合并路由：开放 API 路径走独立中间件，其余走内部认证
+	combinedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/open/") {
+			openAPIHandler.ServeHTTP(w, r)
+			return
+		}
+		AuthMiddleware(mux).ServeHTTP(w, r)
+	})
+
+	cfg := config.Get()
+	addr := fmt.Sprintf("127.0.0.1:%s", cfg.Port)
+
+	return &Server{
+		httpServer: &http.Server{
+			Addr:    addr,
+			Handler: combinedHandler,
+		},
+		handler: handlers,
+	}
+}
+
+// Start 启动 HTTP 服务器监听
+func (s *Server) Start() error {
+	log.Printf("服务监听: http://%s", s.httpServer.Addr)
+	return s.httpServer.ListenAndServe()
+}
+
+// writeJSON 输出 JSON 响应
+func writeJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+// writeSuccess 输出统一成功响应
+func writeSuccess(w http.ResponseWriter, data interface{}) {
+	writeJSON(w, map[string]interface{}{
+		"code":    0,
+		"message": "success",
+		"data":    data,
+	})
+}
