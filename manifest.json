@@ -123,5 +123,28 @@
             "code": "cmspro.localservice.manage",
             "name": "本地服务管理"
         }
+    ],
+    "runtime_files": [
+        {
+            "key": "service_output",
+            "name": "本地服务输出目录",
+            "dir": "app/localservice",
+            "type": "temp",
+            "description": "本地服务脚本输出与工作目录，内容可再生",
+            "cleanable": true,
+            "strategy": "ttl",
+            "ttl_days": 30,
+            "protected": false
+        },
+        {
+            "key": "service_config",
+            "name": "本地服务配置文件",
+            "dir": "local_service_config.json",
+            "type": "other",
+            "description": "本地服务运行配置文件，删除后需重新配置",
+            "cleanable": false,
+            "strategy": "protected",
+            "protected": true
+        }
     ]
 }
