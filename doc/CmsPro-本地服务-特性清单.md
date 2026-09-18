@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.1.2 | 更新日期：2026-09-18
-> 应用版本：1.1.2 | 应用 ID：cmspro.localservice
+> 版本：1.1.3 | 更新日期：2026-09-18
+> 应用版本：1.1.3 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -142,3 +142,4 @@
 | 1.1.0 | 2026-09-18 | 新增 AI 透传扩展（llmrelay）：通用 LLM SSE 透传端点 `/open/llm/*`、决策/日志回调契约、`cmspro_base_url` 配置项；基于应用 v1.1.0 |
 | 1.1.1 | 2026-09-18 | 透传契约新增 `body_override` 请求体改写与 `local_response` 本地短路能力 |
 | 1.1.2 | 2026-09-18 | Go 故障无感切换增强：连接层失败与心跳后失败可换号重试；心跳不掩蔽空闲超时（修复半开连接永不判定）；基于应用 v1.1.2 |
+| 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：架构检测改用 php_uname()、shell 调用统一安全封装（ServiceManager::safeShellExec）；基于应用 v1.1.3 |

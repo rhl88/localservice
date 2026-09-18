@@ -25,6 +25,31 @@ class ServiceManager
     }
 
     /**
+     * 安全执行 shell 命令。
+     * 生产环境（如宝塔）常通过 disable_functions 禁用 shell_exec/exec，
+     * 被禁函数调用会抛 "Call to undefined function" 致命错误（@ 抑制无效），
+     * 因此先经 function_exists 检测；两个函数均不可用时返回 null，由调用方走兜底提示。
+     */
+    protected function safeShellExec(string $cmd): ?string
+    {
+        if (function_exists('shell_exec')) {
+            $output = @shell_exec($cmd);
+            if ($output !== null && $output !== false && trim($output) !== '') {
+                return $output;
+            }
+        }
+        if (function_exists('exec')) {
+            $lines = [];
+            $exitCode = -1;
+            @exec($cmd, $lines, $exitCode);
+            if (!empty($lines)) {
+                return implode("\n", $lines);
+            }
+        }
+        return null;
+    }
+
+    /**
      * 应用根目录绝对路径。
      */
     protected function appPath(): string
@@ -273,11 +298,11 @@ class ServiceManager
         if ($this->isWindows()) {
             // Windows sc 命令没有可靠的 restart 子命令，使用 stop+start 组合
             $stopCmd = 'sc stop ' . escapeshellarg($name) . ' 2>&1';
-            @shell_exec($stopCmd);
+            $this->safeShellExec($stopCmd);
             // 等待服务完全停止
             sleep(2);
             $startCmd = 'sc start ' . escapeshellarg($name) . ' 2>&1';
-            $output = @shell_exec($startCmd);
+            $output = $this->safeShellExec($startCmd);
             if ($output === null) {
                 return [
                     'code' => 503,
@@ -313,27 +338,17 @@ class ServiceManager
         $name = $this->serviceName();
         if ($this->isWindows()) {
             $cmd = 'sc ' . $action . ' ' . escapeshellarg($name) . ' 2>&1';
-            $output = @shell_exec($cmd);
         } else {
             $cmd = '/usr/bin/sudo /usr/bin/systemctl ' . $action . ' ' . escapeshellarg($name) . ' 2>&1';
-            $output = @shell_exec($cmd);
         }
+        $output = $this->safeShellExec($cmd);
 
-        if ($output === null || $output === false) {
-            // shell_exec 不可用时，尝试 exec 作为备选
-            $output = '';
-            $exitCode = -1;
-            @exec($cmd, $outputLines, $exitCode);
-            if (!empty($outputLines)) {
-                $output = implode("\n", $outputLines);
-            }
-            if ($exitCode === -1 && empty($output)) {
-                return [
-                    'code' => 503,
-                    'message' => 'PHP 环境无法执行服务管理命令（exec/shell_exec 均不可用），请通过生成的服务脚本手动操作',
-                    'data' => null,
-                ];
-            }
+        if ($output === null) {
+            return [
+                'code' => 503,
+                'message' => 'PHP 环境无法执行服务管理命令（exec/shell_exec 均不可用），请通过生成的服务脚本手动操作',
+                'data' => null,
+            ];
         }
 
         // Windows 中文系统下 sc 命令输出为 GBK 编码，转为 UTF-8 避免 JSON 序列化失败
@@ -534,8 +549,8 @@ class ServiceManager
             $saveDir = $appPath . DIRECTORY_SEPARATOR . 'Bin' . DIRECTORY_SEPARATOR . 'windows';
             $savePath = $saveDir . DIRECTORY_SEPARATOR . 'cmspro-local-service.exe';
         } else {
-            // Linux 下自动检测架构
-            $arch = trim(@shell_exec('uname -m') ?? '');
+            // Linux 下自动检测架构（php_uname 为纯 PHP 函数，不受 disable_functions 影响）
+            $arch = php_uname('m');
             if (in_array($arch, ['aarch64', 'arm64'])) {
                 $url = 'https://v5.cmspro.cn/apps/localservice/linux/cmspro-local-service-arm64';
                 $savePath = $appPath . DIRECTORY_SEPARATOR . 'Bin' . DIRECTORY_SEPARATOR . 'linux' . DIRECTORY_SEPARATOR . 'cmspro-local-service-arm64';
