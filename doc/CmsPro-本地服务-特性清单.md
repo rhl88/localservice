@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.1.3 | 更新日期：2026-09-18
-> 应用版本：1.1.3 | 应用 ID：cmspro.localservice
+> 版本：1.1.4 | 更新日期：2026-09-18
+> 应用版本：1.1.4 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -143,3 +143,4 @@
 | 1.1.1 | 2026-09-18 | 透传契约新增 `body_override` 请求体改写与 `local_response` 本地短路能力 |
 | 1.1.2 | 2026-09-18 | Go 故障无感切换增强：连接层失败与心跳后失败可换号重试；心跳不掩蔽空闲超时（修复半开连接永不判定）；基于应用 v1.1.2 |
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：架构检测改用 php_uname()、shell 调用统一安全封装（ServiceManager::safeShellExec）；基于应用 v1.1.3 |
+| 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固（宝塔系统加固场景）：自动检测并临时解除 `/etc/systemd/system` 及既有 unit 文件的 `chattr +i`，操作完成后恢复；基于应用 v1.1.4 |

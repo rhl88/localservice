@@ -184,16 +184,22 @@ class ServiceManager
                 . "  echo \"请使用 root 权限运行：sudo bash install-service.sh\"\n"
                 . "  exit 1\n"
                 . "fi\n\n"
+                . "SERVICE_NAME=\"" . $name . "\"\n"
+                . "SYSTEMD_DIR=/etc/systemd/system\n"
+                . "UNIT_FILE=\"\$SYSTEMD_DIR/\$SERVICE_NAME.service\"\n\n"
+                . $this->systemdLockSnippet()
                 . "echo \"正在安装 CmsPro 本地服务...\"\n\n"
                 . "# 确保二进制和包装脚本有执行权限\n"
                 . "chmod +x \"" . $binary . "\" \"" . $wrapperPath . "\"\n\n"
+                . "unlockSystemdDir\n\n"
                 . "# 生成 systemd unit 文件\n"
-                . "cp \"" . $unitPath . "\" /etc/systemd/system/" . $name . ".service\n"
+                . "cp \"" . $unitPath . "\" \"\$UNIT_FILE\"\n"
                 . "systemctl daemon-reload\n"
-                . "systemctl enable " . $name . "\n"
-                . "systemctl start " . $name . "\n\n"
+                . "systemctl enable \"\$SERVICE_NAME\"\n"
+                . "systemctl start \"\$SERVICE_NAME\"\n\n"
+                . "restoreSystemdDir\n\n"
                 . "echo \"安装完成，服务状态：\"\n"
-                . "systemctl status " . $name . " --no-pager\n";
+                . "systemctl status \"\$SERVICE_NAME\" --no-pager\n";
             $path = $this->scriptDir() . DIRECTORY_SEPARATOR . 'install-service.sh';
         }
         file_put_contents($path, $content);
@@ -250,10 +256,16 @@ class ServiceManager
                 . "  echo \"请使用 root 权限运行：sudo bash uninstall-service.sh\"\n"
                 . "  exit 1\n"
                 . "fi\n\n"
+                . "SERVICE_NAME=\"" . $name . "\"\n"
+                . "SYSTEMD_DIR=/etc/systemd/system\n"
+                . "UNIT_FILE=\"\$SYSTEMD_DIR/\$SERVICE_NAME.service\"\n\n"
+                . $this->systemdLockSnippet()
                 . "echo \"正在卸载 CmsPro 本地服务...\"\n\n"
-                . "systemctl stop " . $name . " 2>/dev/null || true\n"
-                . "systemctl disable " . $name . " 2>/dev/null || true\n"
-                . "rm -f /etc/systemd/system/" . $name . ".service\n"
+                . "systemctl stop \"\$SERVICE_NAME\" 2>/dev/null || true\n"
+                . "systemctl disable \"\$SERVICE_NAME\" 2>/dev/null || true\n\n"
+                . "unlockSystemdDir\n"
+                . "rm -f \"\$UNIT_FILE\"\n"
+                . "restoreSystemdDir\n"
                 . "systemctl daemon-reload\n\n"
                 . "echo \"卸载完成。\"\n";
             $path = $this->scriptDir() . DIRECTORY_SEPARATOR . 'uninstall-service.sh';
@@ -268,6 +280,43 @@ class ServiceManager
             'message' => 'success',
             'data' => ['script_path' => $path, 'service_name' => $name],
         ];
+    }
+
+    /**
+     * 生成 shell 片段：临时解除 /etc/systemd/system 的 immutable 加固。
+     *
+     * 宝塔等面板的「系统加固」会对 /etc/systemd/system 目录及其中部分 unit 文件执行
+     * chattr +i，此时即便 root 写入/删除也会报 Operation not permitted（EPERM），
+     * 常规权限判断与 @ 抑制均无效。安装/卸载脚本需先解锁，操作完成后恢复加固。
+     *
+     * 依赖脚本内已定义的 SYSTEMD_DIR / UNIT_FILE 变量；chattr 或 lsattr 缺失时静默跳过。
+     */
+    private function systemdLockSnippet(): string
+    {
+        return "HAS_CHATTR=0\n"
+            . "if command -v chattr >/dev/null 2>&1; then HAS_CHATTR=1; fi\n"
+            . "DIR_LOCKED=0\n\n"
+            . "unlockSystemdDir() {\n"
+            . "  if [ \"\$HAS_CHATTR\" -eq 1 ] && command -v lsattr >/dev/null 2>&1 &&\n"
+            . "     lsattr -d \"\$SYSTEMD_DIR\" 2>/dev/null | awk '{print \$1}' | grep -q 'i'; then\n"
+            . "    echo \"检测到 \$SYSTEMD_DIR 存在 immutable 加固（宝塔系统加固等），临时解除...\"\n"
+            . "    if ! chattr -i \"\$SYSTEMD_DIR\"; then\n"
+            . "      echo \"解除加固失败，请手工执行：chattr -i \$SYSTEMD_DIR 后重试\"\n"
+            . "      exit 1\n"
+            . "    fi\n"
+            . "    DIR_LOCKED=1\n"
+            . "  fi\n"
+            . "  # 已存在的 unit 文件可能同样被加固，否则覆盖写入或删除会失败\n"
+            . "  if [ \"\$HAS_CHATTR\" -eq 1 ] && [ -f \"\$UNIT_FILE\" ]; then\n"
+            . "    chattr -i \"\$UNIT_FILE\" 2>/dev/null || true\n"
+            . "  fi\n"
+            . "}\n\n"
+            . "restoreSystemdDir() {\n"
+            . "  if [ \"\$DIR_LOCKED\" -eq 1 ]; then\n"
+            . "    chattr +i \"\$SYSTEMD_DIR\" 2>/dev/null || true\n"
+            . "    echo \"已恢复 \$SYSTEMD_DIR 的 immutable 加固\"\n"
+            . "  fi\n"
+            . "}\n\n";
     }
 
     /**

@@ -64,6 +64,8 @@ php artisan app:install cmspro.localservice
 
 **Linux 平台**：以 root 身份运行生成的 `.sh` 脚本，完成 systemd 服务注册并启动。
 
+> **宝塔加固兼容**：若服务器启用了宝塔「系统加固」等策略，对 `/etc/systemd/system` 设置了 immutable（`chattr +i`），则即便是 root 写入 unit 文件也会报 `Operation not permitted`。安装/卸载脚本会自动检测该加固并临时解除，操作完成后恢复原状，无需手工干预；`chattr`/`lsattr` 不可用时静默跳过。
+
 ### 3.2 后台功能验证
 
 后台菜单入口「本地服务」，含以下子模块：
@@ -170,3 +172,4 @@ CmsproLocalservice/
 | 1.1.1 | 2026-09-18 | 透传契约新增 `body_override` 请求体改写：决策请求随 `body` 上送客户端原始请求体，决策响应下发 `body_override` 时 Go 整体替换原始请求体转发上游（如应用侧模型别名解析为真实 model_id）；换号重试时决策始终基于原始请求体，改写不污染后续决策 |
 | 1.1.2 | 2026-09-18 | Go 透传故障无感切换增强：上游连接失败、首字节超时、空闲超时、流中断等连接层失败在未向客户端输出实质数据前自动换号重试（此前直接终止）；心跳注释不再重置空闲计时，修复上游挂死时半开连接永不判定导致客户端长时间收不到数据自行断开的问题 |
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：宝塔等面板禁用 shell_exec 时生成安装/卸载脚本报 500 的问题——二进制架构检测改用 php_uname() 纯 PHP 实现；服务启停等 shell 调用统一经 function_exists 安全封装，函数被禁时返回明确业务提示而非致命错误 |
+| 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固：宝塔等面板对 `/etc/systemd/system` 执行 `chattr +i` 后，root 写入/删除 unit 文件同样报 `Operation not permitted`；脚本现自动检测加固并临时解除、操作完成后恢复，同时处理已存在 unit 文件被加固导致覆盖或删除失败的情况，`chattr`/`lsattr` 缺失时静默降级 |
