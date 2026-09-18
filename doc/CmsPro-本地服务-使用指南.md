@@ -165,3 +165,4 @@ CmsproLocalservice/
 |------|------|------|
 | 1.0.0 | 2026-08-13 | 初始版本，基于应用 v1.0.1 编写 |
 | 1.1.0 | 2026-09-18 | 新增 AI 透传扩展（llmrelay）：Go 服务提供通用 LLM SSE 透传端点 `/open/llm/{app}/{prefix}/*path` 与健康检查 `/open/llm/ping`，Go 侧新增 `cmspro_base_url` 配置（回调 CmsPro 基础地址，随 `syncConfig()` 同步）；决策契约支持 `local_response` 本地短路（管理类端点如 models 由 CmsPro 侧本地出数，不透传上游）；接入契约与使用方法见《CmsPro-本地服务-AI透传扩展指南》 |
+| 1.1.1 | 2026-09-18 | 透传契约新增 `body_override` 请求体改写：决策请求随 `body` 上送客户端原始请求体，决策响应下发 `body_override` 时 Go 整体替换原始请求体转发上游（如应用侧模型别名解析为真实 model_id）；换号重试时决策始终基于原始请求体，改写不污染后续决策 |

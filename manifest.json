@@ -2,7 +2,7 @@
     "id": "cmspro.localservice",
     "name": "本地服务",
     "description": "CmsPro 本地系统服务，提供浏览器自动化、进程管理、文件操作等系统级能力",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "author": "CmsPro",
     "require": {
         "php": ">=8.1",

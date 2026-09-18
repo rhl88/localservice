@@ -64,6 +64,9 @@ type DispatchData struct {
 	ProxyIP       string            `json:"proxy_ip"`
 	RetryPolicy   RetryPolicy       `json:"retry_policy"`
 	LocalResponse *LocalResponse    `json:"local_response"`
+	// BodyOverride 改写后的请求体（如模型别名解析为真实 model_id），
+	// 非空时整体替换客户端原始请求体转发上游
+	BodyOverride json.RawMessage `json:"body_override"`
 }
 
 type dispatchResponse struct {
@@ -145,13 +148,14 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 	authHeader := r.Header.Get("Authorization")
 	model, stream := extractModelAndStream(body)
 	clientIP := clientIP(r)
+	origBody := body // 决策请求始终携带客户端原始请求体（改写只影响转发，不污染后续决策）
 
 	var tried []int64
 	var lastDispatch *DispatchData
 	var result *streamResult
 
 	for attempt := 0; ; attempt++ {
-		d, derr := callDispatch(r.Context(), app, authHeader, path, model, stream, clientIP, tried)
+		d, derr := callDispatch(r.Context(), app, authHeader, path, model, stream, clientIP, tried, origBody)
 		if derr != nil {
 			// 决策层（PHP）已含选号/重试语义，失败直接以错误 chunk 返回
 			result = &streamResult{status: "failed", errMessage: derr.Error()}
@@ -173,6 +177,12 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 			w.WriteHeader(status)
 			w.Write(d.LocalResponse.Body)
 			return
+		}
+
+		// 请求体改写：决策接口下发改写后的请求体（如模型别名解析为真实
+		// model_id），整体替换客户端原始请求体后转发上游
+		if len(d.BodyOverride) > 0 {
+			body = []byte(d.BodyOverride)
 		}
 
 		res := forwardOnce(w, r, flusher, d, path, body, model, stream)
@@ -401,7 +411,7 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 
 // callDispatch 调用应用决策接口
 func callDispatch(ctx context.Context, app, authHeader, path string, model string,
-	stream bool, clientIP string, tried []int64) (*DispatchData, error) {
+	stream bool, clientIP string, tried []int64, origBody []byte) (*DispatchData, error) {
 
 	cfg := config.Get()
 	endpoint := strings.TrimRight(cfg.CmsproBaseURL, "/") + "/api/" + app + "/internal/dispatch"
@@ -411,6 +421,9 @@ func callDispatch(ctx context.Context, app, authHeader, path string, model strin
 		"stream":            stream,
 		"client_ip":         clientIP,
 		"tried_account_ids": tried,
+		// 客户端原始请求体随决策请求上送：改写权在 CmsPro 侧
+		// （模型别名解析等），改写结果经 body_override 下发
+		"body": json.RawMessage(origBody),
 	}
 	payloadBytes, _ := json.Marshal(payload)
 

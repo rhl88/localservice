@@ -3,6 +3,7 @@ package llmrelay
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -265,6 +266,43 @@ func TestRelayNonStream(t *testing.T) {
 	cb := env.waitCallback(t)
 	if cb["total_tokens"] != float64(15) {
 		t.Fatalf("非流式回调 total_tokens = %v, 期望 15", cb["total_tokens"])
+	}
+}
+
+// TestRelayBodyOverride 决策下发 body_override 时整体替换原始请求体转发上游
+func TestRelayBodyOverride(t *testing.T) {
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		_ = json.Unmarshal(raw, &payload)
+		// 上游应收到改写后的真实 model_id，而非客户端原始别名
+		if payload["model"] != "deepseek/deepseek-v4-flash" {
+			t.Errorf("上游收到 model = %v, 期望改写后的真实 model_id", payload["model"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	})
+
+	setup(t, func(w http.ResponseWriter, r *http.Request) bool {
+		data := DispatchData{
+			DispatchID:   "dp-override",
+			UpstreamURL:  upstream.URL + "/v1/chat/completions",
+			AuthHeader:   "Bearer k",
+			AccountID:    1,
+			RetryPolicy:  policyZero(),
+			BodyOverride: json.RawMessage(`{"model":"deepseek/deepseek-v4-flash","stream":false,"messages":[]}`),
+		}
+		writeJSON(w, http.StatusOK, dispatchResponse{Code: 0, Message: "success", Data: &data})
+		return true
+	})
+
+	body := `{"model":"deepseek-v4-flash-loc","stream":false,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), `"content":"hi"`) {
+		t.Fatalf("响应未透传: %s", w.Body.String())
 	}
 }
 
