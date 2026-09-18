@@ -47,16 +47,23 @@ type RetryPolicy struct {
 	LongTaskThresholdMs  int64 `json:"long_task_threshold_ms"`
 }
 
+// LocalResponse PHP 决策的本地短路响应（models 等管理类端点由 CmsPro 侧直接出数，不透传上游）
+type LocalResponse struct {
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
+}
+
 // DispatchData 决策接口 data 载荷
 type DispatchData struct {
-	DispatchID  string            `json:"dispatch_id"`
-	UpstreamURL string            `json:"upstream_url"`
-	AuthHeader  string            `json:"auth_header"`
-	AuthExtra   map[string]string `json:"auth_extra"`
-	Proxy       *ProxyConfig      `json:"proxy"`
-	AccountID   int64             `json:"account_id"`
-	ProxyIP     string            `json:"proxy_ip"`
-	RetryPolicy RetryPolicy       `json:"retry_policy"`
+	DispatchID    string            `json:"dispatch_id"`
+	UpstreamURL   string            `json:"upstream_url"`
+	AuthHeader    string            `json:"auth_header"`
+	AuthExtra     map[string]string `json:"auth_extra"`
+	Proxy         *ProxyConfig      `json:"proxy"`
+	AccountID     int64             `json:"account_id"`
+	ProxyIP       string            `json:"proxy_ip"`
+	RetryPolicy   RetryPolicy       `json:"retry_policy"`
+	LocalResponse *LocalResponse    `json:"local_response"`
 }
 
 type dispatchResponse struct {
@@ -155,6 +162,18 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 			return
 		}
 		lastDispatch = d
+
+		// 本地短路：决策接口指定本地响应（models 等管理类端点），不连上游、不回调日志
+		if d.LocalResponse != nil && len(d.LocalResponse.Body) > 0 {
+			status := d.LocalResponse.Status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			w.Write(d.LocalResponse.Body)
+			return
+		}
 
 		res := forwardOnce(w, r, flusher, d, path, body, model, stream)
 		if res.status == "success" || res.status == "interrupted" {

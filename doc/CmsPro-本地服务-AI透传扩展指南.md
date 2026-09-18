@@ -116,6 +116,7 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 | `account_id` | 本次决策使用的账号 ID（日志回调原样带回） |
 | `proxy_ip` | 出口 IP 展示值（仅日志用） |
 | `retry_policy` | 重试策略（毫秒），字段含义见下表 |
+| `local_response` | **本地短路响应（可选）**。存在时 Go 直接把 `body` 以 `status` 状态码写给客户端（`Content-Type: application/json`），不连上游、不发日志回调。用于 models 等管理类端点由 CmsPro 侧本地出数（如仅返回后台「启用」的模型），决策失败语义不适用（短路即最终响应） |
 
 **retry_policy 字段**：
 
@@ -203,6 +204,7 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 
 | 行为 | 说明 |
 |------|------|
+| 本地短路 | 决策响应含 `local_response`（`{status, body}`）时直接写回客户端，不连上游、不回调日志——管理类端点（models 等）由 CmsPro 侧本地出数的通用机制 |
 | 重试边界 | 未向客户端写出任何字节前，上游失败可按 `retry_policy.max_retries` 重新回调决策接口换号；一旦开始写客户端（首字节已出）则不再重试，优雅收尾并回调 `failed` |
 | 心跳保活 | 首字节前按 `first_byte_heartbeat_ms`、活跃期按 `heartbeat_interval_ms` 向客户端发送 SSE 注释行（`: keep-alive`），防止客户端/网关空闲断连 |
 | usage 提取 | 自定义跨块行扫描器解析 SSE 数据行中的 `usage` 字段，兼容上游分块切割 JSON 行的情况 |

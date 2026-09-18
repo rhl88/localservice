@@ -295,6 +295,47 @@ func TestRelayDispatchFailure(t *testing.T) {
 	}
 }
 
+// TestRelayLocalResponse 决策返回本地短路响应（models 管理端点）→ 直接写回，不连上游、不回调
+func TestRelayLocalResponse(t *testing.T) {
+	upstreamHit := false
+	sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		fmt.Fprint(w, `{"should":"not-called"}`)
+	})
+
+	env := setup(t, func(w http.ResponseWriter, r *http.Request) bool {
+		data := DispatchData{
+			LocalResponse: &LocalResponse{
+				Status: http.StatusOK,
+				Body:   json.RawMessage(`{"object":"list","data":[{"id":"glm-5.2","object":"model"}]}`),
+			},
+		}
+		writeJSON(w, http.StatusOK, dispatchResponse{Code: 0, Message: "success", Data: &data})
+		return true
+	})
+
+	body := `{"model":"m","stream":false}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/open/llm/cline/v1/models", nil)
+	relay(w, r, "cline", "v1/models", []byte(body))
+
+	if got := w.Body.String(); !strings.Contains(got, `"id":"glm-5.2"`) || strings.Contains(got, "not-called") {
+		t.Fatalf("客户端应收到本地短路响应体: %s", got)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, 期望 application/json", ct)
+	}
+	if upstreamHit {
+		t.Fatal("本地短路不应请求上游")
+	}
+	// 短路不产生日志回调
+	select {
+	case p := <-env.callbacks:
+		t.Fatalf("本地短路不应产生日志回调: %v", p)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // TestRelayNoRetryAfterWrite 已向客户端写出数据后上游断开 → 不换号重试
 func TestRelayNoRetryAfterWrite(t *testing.T) {
 	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
