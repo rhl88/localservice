@@ -3,3 +3,6 @@
 
 # Windows 服务重启时自动产生的运行残留
 *.residual
+
+# 本地服务运行时配置（含本机生成的 auth_token，由 syncConfig 自动维护）
+Bin/storage/local_service_config.json

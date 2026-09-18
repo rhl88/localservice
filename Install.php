@@ -3,6 +3,7 @@
 namespace App\Apps\CmsproLocalservice;
 
 use App\Apps\CmsproLocalservice\Services\ScriptService;
+use App\Apps\CmsproLocalservice\Services\ServiceManager;
 use App\Apps\CmsproLocalservice\Models\CustomScript;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -16,6 +17,9 @@ class Install
         $this->runMigrations();
         $this->ensureAuthToken();
         $this->initDefaultScripts();
+        // 安装/重装后 token 可能已变更，同步刷新 Go 服务配置文件，
+        // 避免运行中的 Go 进程持有旧 token 导致认证失败（服务显示离线）
+        $this->syncGoConfig();
     }
 
     public function uninstall(): void
@@ -28,6 +32,23 @@ class Install
     {
         $this->runMigrations();
         $this->ensureAuthToken();
+        $this->syncGoConfig();
+    }
+
+    /**
+     * 将数据库中的配置同步写入 Go 服务配置文件。
+     * 失败不阻塞安装流程（如 storage 目录不可写），仅记录日志。
+     */
+    protected function syncGoConfig(): void
+    {
+        try {
+            app(ServiceManager::class)->syncConfig();
+        } catch (\Throwable $e) {
+            Log::warning('CmsproLocalservice: 同步 Go 服务配置文件失败，请到「基本配置」保存后重启服务', [
+                'app' => 'cmspro.localservice',
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**

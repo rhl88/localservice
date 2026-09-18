@@ -2,6 +2,7 @@
 
 namespace App\Apps\CmsproLocalservice\Controllers\Admin\Api;
 
+use App\Apps\CmsproLocalservice\Services\ServiceManager;
 use App\Http\Responses\ApiResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -42,6 +43,9 @@ class SettingApiController
             $this->write($name, (string) $value);
         }
 
+        // 同步写入 Go 服务配置文件，重启 Go 服务后生效
+        app(ServiceManager::class)->syncConfig();
+
         return ApiResponse::success(['saved' => true]);
     }
 
@@ -52,6 +56,8 @@ class SettingApiController
     {
         $token = Str::random(32);
         $this->write('auth_token', $token);
+        // Token 变更后同步配置文件，否则运行中的 Go 服务仍持旧 Token 导致认证失败（服务显示离线）
+        app(ServiceManager::class)->syncConfig();
         return ApiResponse::success(['auth_token' => $token]);
     }
 
@@ -62,6 +68,7 @@ class SettingApiController
     {
         $key = Str::random(32);
         $this->write('open_api_key', $key);
+        app(ServiceManager::class)->syncConfig();
         return ApiResponse::success(['open_api_key' => $key]);
     }
 

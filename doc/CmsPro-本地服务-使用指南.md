@@ -1,7 +1,7 @@
 # CmsPro-本地服务-使用指南
 
-> 版本：1.0.0 | 更新日期：2026-09-18
-> 应用版本：1.1.3 | 应用 ID：cmspro.localservice
+> 版本：1.1.0 | 更新日期：2026-09-18
+> 应用版本：1.1.5 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -159,7 +159,13 @@ CmsproLocalservice/
 
 - 确认 Go 服务在运行（`isOnline()` 返回 false 即服务未启动）
 - 确认 Token 一致：PHP 端 `config_items` 与 Go 端 `local_service_config.json` 中的 `auth_token` 必须相同
-- 修改 Token 或端口后，需在「基本配置」页面保存触发 `syncConfig()`，并重启 Go 服务
+- 修改 Token 或端口后，需重启 Go 服务生效（保存「基本配置」或重新生成 Token 时会自动同步 Go 配置文件，但运行中的 Go 进程需重启才会重新加载）
+
+### Q6：卸载重装应用后服务显示离线/无法连接？
+
+- 根因：卸载重装后 PHP 端 Token 已重新生成，而运行中的 Go 服务进程仍持有旧 Token，双方认证失败（HTTP 401），后台即显示服务离线
+- 处理：在「基本配置」页面重新保存设置或重新生成 Token（会自动同步 Go 配置文件），然后重启 Go 服务（Windows 管理员执行 `sc stop CmsProLocalService && sc start CmsProLocalService`；Linux 执行 `systemctl restart CmsProLocalService`）
+- v1.1.5 起安装/升级时自动同步 Go 配置文件，重装后只需重启 Go 服务即可恢复
 
 ---
 
@@ -173,3 +179,4 @@ CmsproLocalservice/
 | 1.1.2 | 2026-09-18 | Go 透传故障无感切换增强：上游连接失败、首字节超时、空闲超时、流中断等连接层失败在未向客户端输出实质数据前自动换号重试（此前直接终止）；心跳注释不再重置空闲计时，修复上游挂死时半开连接永不判定导致客户端长时间收不到数据自行断开的问题 |
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：宝塔等面板禁用 shell_exec 时生成安装/卸载脚本报 500 的问题——二进制架构检测改用 php_uname() 纯 PHP 实现；服务启停等 shell 调用统一经 function_exists 安全封装，函数被禁时返回明确业务提示而非致命错误 |
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固：宝塔等面板对 `/etc/systemd/system` 执行 `chattr +i` 后，root 写入/删除 unit 文件同样报 `Operation not permitted`；脚本现自动检测加固并临时解除、操作完成后恢复，同时处理已存在 unit 文件被加固导致覆盖或删除失败的情况，`chattr`/`lsattr` 缺失时静默降级 |
+| 1.1.5 | 2026-09-18 | 修复卸载重装后服务显示离线的问题：重装后 PHP 端 Token 重新生成，但 Go 配置文件与运行中进程仍持旧 Token 导致认证 401；现安装/升级时自动同步 Go 配置文件，「基本配置」保存、重新生成 Token/开放 API 密钥后也自动同步（此前保存操作不会同步，文档描述与实现不符） |
