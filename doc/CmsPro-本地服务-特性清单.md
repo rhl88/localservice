@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.0.0 | 更新日期：2026-08-13
-> 应用版本：1.0.1 | 应用 ID：cmspro.localservice
+> 版本：1.1.0 | 更新日期：2026-09-18
+> 应用版本：1.1.0 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -18,6 +18,7 @@
 | 安装卸载 | `Install.php` 处理安装/卸载/升级 | `Install.php` |
 | 三终端 | 后台（admin） | `ServiceProvider::registerRoutes()` |
 | Go 服务 | 独立常驻 Go 服务（Windows 服务/Linux daemon）承担实际执行 | `Bin/`、`go-src/` |
+| AI 透传扩展 | 通用 LLM 流式透传处理器：Go 承接 SSE 双向转发（goroutine 不占 php-cgi worker），PHP 保留决策/日志/账号维护；通用路由 `/open/llm/{app}/{prefix}/*path`，任意应用按契约接入 | `go-src/internal/llmrelay/`、`doc/CmsPro-本地服务-AI透传扩展指南.md` |
 
 ---
 
@@ -138,3 +139,4 @@
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | 1.0.0 | 2026-08-13 | 初始版本，基于应用 v1.0.1 编写 |
+| 1.1.0 | 2026-09-18 | 新增 AI 透传扩展（llmrelay）：通用 LLM SSE 透传端点 `/open/llm/*`、决策/日志回调契约、`cmspro_base_url` 配置项；基于应用 v1.1.0 |

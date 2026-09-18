@@ -416,6 +416,16 @@ class ServiceManager
     }
 
     /**
+     * 本地服务基础地址（含端口，如 http://127.0.0.1:9501）。
+     *
+     * 供其它应用（如 Clineproxy 的 AI 透传扩展）拼装 Go 透传接入地址使用。
+     */
+    public function relayBaseUrl(): string
+    {
+        return 'http://127.0.0.1:' . $this->configItem('port', 9501);
+    }
+
+    /**
      * 是否运行中（HTTP 探测）。
      */
     public function isRunning(): bool
@@ -448,6 +458,8 @@ class ServiceManager
             'open_api_enabled' => (bool) $this->configItem('open_api_enabled', 0),
             'open_api_key' => (string) $this->configItem('open_api_key', ''),
             'timezone' => (string) $this->configItem('timezone', 'Asia/Shanghai'),
+            // AI 透传扩展回调 CmsPro 的基础地址（Go 决策/日志回调用），数据库未配置时回退 app.url
+            'cmspro_base_url' => (string) $this->configItem('cmspro_base_url', config('app.url', 'http://www.cmspro.com')),
         ];
         $json = json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         file_put_contents($path, $json);

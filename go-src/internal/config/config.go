@@ -18,6 +18,7 @@ type Config struct {
 	OpenAPIEnabled   bool   `json:"open_api_enabled"`
 	OpenAPIKey       string `json:"open_api_key"`
 	Timezone         string `json:"timezone"`
+	CmsproBaseURL    string `json:"cmspro_base_url"`
 }
 
 var (
@@ -73,6 +74,9 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Timezone == "" {
 		c.Timezone = "Asia/Shanghai"
+	}
+	if c.CmsproBaseURL == "" {
+		c.CmsproBaseURL = "http://www.cmspro.com"
 	}
 
 	current = &c

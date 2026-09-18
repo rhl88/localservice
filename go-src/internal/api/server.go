@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"cmspro-local-service/internal/config"
+	"cmspro-local-service/internal/llmrelay"
 )
 
 // Server HTTP 服务器封装
@@ -41,7 +42,13 @@ func NewServer(handlers *Handlers) *Server {
 	openAPIHandler := OpenAPIAuthMiddleware(openMux)
 
 	// 合并路由：开放 API 路径走独立中间件，其余走内部认证
+	// AI 透传路由（/open/llm/）不做应用级鉴权：鉴权委托各应用决策接口，
+	// 客户端 Authorization 原样透传；服务仅监听 127.0.0.1
 	combinedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/open/llm/") {
+			llmrelay.Handler(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/open/") {
 			openAPIHandler.ServeHTTP(w, r)
 			return
