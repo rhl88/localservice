@@ -84,8 +84,8 @@ type streamResult struct {
 	finishReason  string
 	errMessage    string
 	errKind       string // 错误归类：auth | rate_limit | upstream | connect | timeout | client（空=无错误）
-	wroteToClient bool   // 是否已向客户端写出过数据（决定能否换号重试）
-	retryable     bool   // 失败是否可换号重试（上游状态码语义）
+	wroteToClient bool   // 是否已向客户端写出过实质数据（SSE 注释行 ping/notice 不算；决定能否换号重试）
+	retryable     bool   // 失败是否可换号重试（连接层失败与上游状态码语义）
 }
 
 var (
@@ -190,7 +190,7 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 			callbackAsync(app, d, res, model, stream)
 			return
 		}
-		// failed：可重试（未向客户端输出任何数据）且未达上限 → 换号重来
+		// failed：可重试（未向客户端输出实质数据）且未达上限 → 换号重来
 		if res.retryable && !res.wroteToClient && attempt < d.RetryPolicy.MaxRetries {
 			tried = append(tried, d.AccountID)
 			result = res
@@ -235,7 +235,7 @@ func forwardOnce(w http.ResponseWriter, r *http.Request, flusher http.Flusher,
 	}
 	req, err := http.NewRequestWithContext(ctx, method, d.UpstreamURL, bytes.NewReader(body))
 	if err != nil {
-		return &streamResult{status: "failed", errMessage: "构造上游请求失败: " + err.Error()}
+		return &streamResult{status: "failed", errMessage: "构造上游请求失败: " + err.Error(), retryable: true}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if d.AuthHeader != "" {
@@ -250,7 +250,9 @@ func forwardOnce(w http.ResponseWriter, r *http.Request, flusher http.Flusher,
 		if ctx.Err() != nil {
 			return &streamResult{status: "interrupted", errMessage: "客户端中断", errKind: "client"}
 		}
-		return &streamResult{status: "failed", errMessage: "上游连接失败: " + err.Error(), errKind: "connect"}
+		// 连接层失败（含首字节超时）：对齐 PHP 通道故障切换语义——
+		// 未向客户端输出前换号重试（重新决策排除已试账号/换出口），而非直接终止
+		return &streamResult{status: "failed", errMessage: "上游连接失败: " + err.Error(), errKind: "connect", retryable: true}
 	}
 	defer resp.Body.Close()
 
@@ -271,7 +273,8 @@ func forwardOnce(w http.ResponseWriter, r *http.Request, flusher http.Flusher,
 		// 非流式：整体缓冲后一次性返回
 		data, rerr := io.ReadAll(resp.Body)
 		if rerr != nil {
-			return &streamResult{status: "failed", errMessage: "读取上游响应失败: " + rerr.Error()}
+			// 响应尚未写回客户端，可换号重试
+			return &streamResult{status: "failed", errMessage: "读取上游响应失败: " + rerr.Error(), retryable: true}
 		}
 		// 非流式按 JSON 透传（Content-Type 沿用上游）
 		for k, vs := range resp.Header {
@@ -325,7 +328,8 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 	}()
 
 	sc := &lineScanner{} // 跨块行缓冲，扫描 usage / finish_reason
-	activity := start
+	activity := start    // 上游最近一次数据到达时间（仅上游数据更新，心跳不计入）
+	lastPing := start    // 上次心跳写出时间（独立计时，不掩蔽空闲超时）
 	firstByte := false
 	wrote := false // 是否已向客户端写出过数据
 	longTaskNotified := false
@@ -340,7 +344,8 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 			if !ok {
 				// 上游关闭：EOF 视为正常结束
 				if err := <-errCh; err != nil && err != io.EOF {
-					return &streamResult{status: "failed", wroteToClient: wrote,
+					// 未输出实质数据时标记可重试（主循环按 wroteToClient 拦截已输出场景）
+					return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
 						errMessage: "上游读取失败: " + err.Error(), errKind: "upstream"}
 				}
 				// 处理行缓冲残留
@@ -359,7 +364,7 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 				lastResult = r
 			}
 			if _, err := w.Write(chunk); err != nil {
-				return &streamResult{status: "interrupted", wroteToClient: true,
+				return &streamResult{status: "interrupted", wroteToClient: true, errKind: "client",
 					errMessage: "客户端写入失败: " + err.Error()}
 			}
 			wrote = true
@@ -369,9 +374,10 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 
 		case <-ticker.C:
 			idle := time.Since(activity)
-			// 空闲超时（对齐 PHP 通道 read_timeout 语义）
+			// 空闲超时（对齐 PHP 通道 read_timeout 语义）：仅上游数据到达才重置
+			// 空闲计时，心跳注释不掩蔽半开连接检测；未输出实质数据时标记可重试
 			if policy.ReadTimeoutMs > 0 && idle > msDuration(policy.ReadTimeoutMs) {
-				return &streamResult{status: "failed", wroteToClient: wrote,
+				return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
 					errMessage: "上游空闲超时（半开连接判定）", errKind: "timeout",
 					promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
 					totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
@@ -381,12 +387,12 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 			if !firstByte && policy.FirstByteHeartbeatMs > 0 {
 				interval = msDuration(policy.FirstByteHeartbeatMs)
 			}
-			if interval > 0 && idle >= interval {
+			if interval > 0 && time.Since(lastPing) >= interval {
 				w.Write([]byte(": ping\n\n"))
 				if flusher != nil {
 					flusher.Flush()
 				}
-				activity = time.Now() // 心跳重置空闲计时
+				lastPing = time.Now()
 			}
 			// 长任务预警（event: notice，与 PHP 通道格式一致）
 			if !longTaskNotified && policy.LongTaskThresholdMs > 0 &&
@@ -399,7 +405,7 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 			}
 
 		case <-ctx.Done():
-			return &streamResult{status: "interrupted", wroteToClient: wrote,
+			return &streamResult{status: "interrupted", wroteToClient: wrote, errKind: "client",
 				errMessage: "客户端中断",
 				promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
 				totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}

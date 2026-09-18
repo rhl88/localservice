@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -401,5 +403,141 @@ func TestRelayNoRetryAfterWrite(t *testing.T) {
 	env.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("决策调用次数 = %d, 期望 1（已写客户端不可重试）", calls)
+	}
+}
+
+// TestRelayRetryOnConnectError 上游连接失败（端口拒绝连接）→ 未写客户端 → 换号重试成功
+func TestRelayRetryOnConnectError(t *testing.T) {
+	// 构造一个必然拒绝连接的地址：监听后立即关闭
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听失败: %v", err)
+	}
+	deadURL := fmt.Sprintf("http://%s/v1/chat/completions", l.Addr().String())
+	l.Close()
+
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	env := setup(t,
+		dispatchOK(t, deadURL, "Bearer k1", policy, 1),
+		func(w http.ResponseWriter, r *http.Request) bool {
+			// 第二次决策应携带 tried_account_ids=[1]
+			var payload map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			tried, _ := payload["tried_account_ids"].([]interface{})
+			if len(tried) != 1 || tried[0] != float64(1) {
+				t.Errorf("第二次决策 tried_account_ids = %v, 期望 [1]", tried)
+			}
+			return dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 3)(w, r)
+		},
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("连接失败换号重试后客户端应收到成功内容: %s", w.Body.String())
+	}
+	cb := env.waitCallback(t)
+	if cb["account_id"] != float64(3) {
+		t.Fatalf("回调 account_id = %v, 期望 3（第二个账号）", cb["account_id"])
+	}
+}
+
+// TestRelayRetryOnFirstByteTimeout 上游首字节超时（连接建立但迟迟不响应）→ 未写客户端 → 换号重试成功
+func TestRelayRetryOnFirstByteTimeout(t *testing.T) {
+	var hits int32
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// 第一次：连接成功后长时间不吐首字节（有界等待避免测试悬挂），
+			// Go 侧 ResponseHeaderTimeout 到期即连接失败并换号重试
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	policy.FirstByteTimeoutMs = 100
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 3),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("首字节超时换号重试后客户端应收到成功内容: %s", w.Body.String())
+	}
+	cb := env.waitCallback(t)
+	if cb["account_id"] != float64(3) {
+		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
+	}
+}
+
+// TestRelayRetryOnIdleTimeout 心跳注释后上游空闲断开 → 注释行不算实质数据 → 仍可换号重试成功
+func TestRelayRetryOnIdleTimeout(t *testing.T) {
+	var hits int32
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// 第一次：先下发响应头（进入流式转发循环），随后既不吐数据
+			// 也不关闭（有界等待避免测试悬挂），由 Go 侧空闲超时判定半开
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	policy.FirstByteHeartbeatMs = 20 // 20ms 即发 ping 注释
+	policy.ReadTimeoutMs = 150       // 150ms 无实质数据判半开
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 3),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	respBody := w.Body.String()
+	// 客户端已收到心跳注释（重试前的 SSE 注释行，合法且被客户端忽略）
+	if !strings.Contains(respBody, ": ping") {
+		t.Fatalf("重试前应已向客户端发送心跳注释: %s", respBody)
+	}
+	// 换号重试后仍成功：ping 注释不算实质数据，客户端无感接续新流
+	if !strings.Contains(respBody, "ok") {
+		t.Fatalf("空闲超时换号重试后客户端应收到成功内容: %s", respBody)
+	}
+	cb := env.waitCallback(t)
+	if cb["account_id"] != float64(3) {
+		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
 	}
 }
