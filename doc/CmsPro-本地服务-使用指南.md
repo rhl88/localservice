@@ -1,7 +1,7 @@
 # CmsPro-本地服务-使用指南
 
-> 版本：1.1.0 | 更新日期：2026-09-18
-> 应用版本：1.1.5 | 应用 ID：cmspro.localservice
+> 版本：1.1.0 | 更新日期：2026-09-20
+> 应用版本：1.1.6 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -180,3 +180,4 @@ CmsproLocalservice/
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：宝塔等面板禁用 shell_exec 时生成安装/卸载脚本报 500 的问题——二进制架构检测改用 php_uname() 纯 PHP 实现；服务启停等 shell 调用统一经 function_exists 安全封装，函数被禁时返回明确业务提示而非致命错误 |
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固：宝塔等面板对 `/etc/systemd/system` 执行 `chattr +i` 后，root 写入/删除 unit 文件同样报 `Operation not permitted`；脚本现自动检测加固并临时解除、操作完成后恢复，同时处理已存在 unit 文件被加固导致覆盖或删除失败的情况，`chattr`/`lsattr` 缺失时静默降级 |
 | 1.1.5 | 2026-09-18 | 修复卸载重装后服务显示离线的问题：重装后 PHP 端 Token 重新生成，但 Go 配置文件与运行中进程仍持旧 Token 导致认证 401；现安装/升级时自动同步 Go 配置文件，「基本配置」保存、重新生成 Token/开放 API 密钥后也自动同步（此前保存操作不会同步，文档描述与实现不符） |
+| 1.1.6 | 2026-09-20 | 修复 Go 透传通道高频报「上游连接失败: http2: timeout awaiting response headers」的问题：等响应头预算此前误用 first_byte_timeout（10s/30s），大上下文 prefill 超过即失败；现决策契约新增 `header_timeout_ms`（对齐 PHP 通道 header_timeout=60s），first_byte_timeout 回归「响应头后首数据空读上限」语义。需各接入应用同步升级后生效 |

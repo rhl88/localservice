@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.1.4 | 更新日期：2026-09-18
-> 应用版本：1.1.4 | 应用 ID：cmspro.localservice
+> 版本：1.1.6 | 更新日期：2026-09-20
+> 应用版本：1.1.6 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -144,3 +144,4 @@
 | 1.1.2 | 2026-09-18 | Go 故障无感切换增强：连接层失败与心跳后失败可换号重试；心跳不掩蔽空闲超时（修复半开连接永不判定）；基于应用 v1.1.2 |
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：架构检测改用 php_uname()、shell 调用统一安全封装（ServiceManager::safeShellExec）；基于应用 v1.1.3 |
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固（宝塔系统加固场景）：自动检测并临时解除 `/etc/systemd/system` 及既有 unit 文件的 `chattr +i`，操作完成后恢复；基于应用 v1.1.4 |
+| 1.1.6 | 2026-09-20 | 透传超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底）；`first_byte_timeout_ms` 回归真实语义（响应头后首数据空读上限，与 read_timeout_ms 取较小值），修复大上下文 prefill 期间「http2: timeout awaiting response headers」误判；基于应用 v1.1.6 |

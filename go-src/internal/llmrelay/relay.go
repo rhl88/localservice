@@ -40,6 +40,7 @@ type ProxyConfig struct {
 // RetryPolicy 重试与流控策略（决策接口返回，取自应用配置）
 type RetryPolicy struct {
 	MaxRetries           int   `json:"max_retries"`
+	HeaderTimeoutMs      int64 `json:"header_timeout_ms"`
 	FirstByteTimeoutMs   int64 `json:"first_byte_timeout_ms"`
 	ReadTimeoutMs        int64 `json:"read_timeout_ms"`
 	HeartbeatIntervalMs  int64 `json:"heartbeat_interval_ms"`
@@ -212,9 +213,15 @@ func forwardOnce(w http.ResponseWriter, r *http.Request, flusher http.Flusher,
 	start := time.Now()
 	policy := d.RetryPolicy
 
-	// 构造上游 Transport（可选出口代理）
+	// 构造上游 Transport（可选出口代理）。
+	// 等响应头预算：优先 header_timeout_ms（对齐 PHP 通道 header_timeout 配置，
+	// 覆盖大上下文 prefill 的完整耗时），未下发（0/负）时兜底 first_byte_timeout_ms
+	headerTimeoutMs := policy.HeaderTimeoutMs
+	if headerTimeoutMs <= 0 {
+		headerTimeoutMs = policy.FirstByteTimeoutMs
+	}
 	transport := &http.Transport{
-		ResponseHeaderTimeout: msDuration(policy.FirstByteTimeoutMs),
+		ResponseHeaderTimeout: msDuration(headerTimeoutMs),
 	}
 	if d.Proxy != nil && d.Proxy.Host != "" {
 		proxyURL, err := buildProxyURL(d.Proxy)
@@ -328,7 +335,11 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 	}()
 
 	sc := &lineScanner{} // 跨块行缓冲，扫描 usage / finish_reason
-	activity := start    // 上游最近一次数据到达时间（仅上游数据更新，心跳不计入）
+	// headersAt：响应头已收到（进入本函数即 client.Do 成功返回）。首数据字节
+	// 前的空闲计时从此刻起算（对齐 PHP 通道 first_byte_timeout「响应头之后
+	// 的空读上限」语义，prefill 期间不再受等头预算双重挤压）
+	headersAt := time.Now()
+	activity := headersAt // 上游最近一次数据到达时间（仅上游数据更新，心跳不计入）
 	lastPing := start    // 上次心跳写出时间（独立计时，不掩蔽空闲超时）
 	firstByte := false
 	wrote := false // 是否已向客户端写出过数据
@@ -373,12 +384,21 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 			}
 
 		case <-ticker.C:
-			idle := time.Since(activity)
-			// 空闲超时（对齐 PHP 通道 read_timeout 语义）：仅上游数据到达才重置
-			// 空闲计时，心跳注释不掩蔽半开连接检测；未输出实质数据时标记可重试
-			if policy.ReadTimeoutMs > 0 && idle > msDuration(policy.ReadTimeoutMs) {
+			// 空闲超时（对齐 PHP 通道超时语义）：仅上游数据到达才重置空闲计时，
+			// 心跳注释不掩蔽半开连接检测；未输出实质数据时标记可重试。
+			// 首数据字节前（大上下文 prefill 期）：上限取 first_byte_timeout 与
+			// read_timeout 的较小值（0/负=该项禁用）；首字节后维持 read_timeout
+			if firstByte {
+				if policy.ReadTimeoutMs > 0 && time.Since(activity) > msDuration(policy.ReadTimeoutMs) {
+					return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
+						errMessage: "上游空闲超时（半开连接判定）", errKind: "timeout",
+						promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
+						totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
+				}
+			} else if limit := minPositiveMs(policy.FirstByteTimeoutMs, policy.ReadTimeoutMs); limit > 0 &&
+				time.Since(headersAt) > msDuration(limit) {
 				return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
-					errMessage: "上游空闲超时（半开连接判定）", errKind: "timeout",
+					errMessage: "上游首数据超时（响应头已收到但未产出数据，prefill 可能过长）", errKind: "timeout",
 					promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
 					totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
 			}
@@ -724,4 +744,22 @@ func msDuration(ms int64) time.Duration {
 		return 0
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// minPositiveMs 取两值中较小的正值（0/负视为该项禁用，不参与比较）；
+// 两者均禁用时返回 0（调用方以 >0 判定是否启用上限）
+func minPositiveMs(a, b int64) int64 {
+	switch {
+	case a > 0 && b > 0:
+		if a < b {
+			return a
+		}
+		return b
+	case a > 0:
+		return a
+	case b > 0:
+		return b
+	default:
+		return 0
+	}
 }

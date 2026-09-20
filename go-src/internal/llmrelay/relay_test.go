@@ -492,6 +492,74 @@ func TestRelayRetryOnFirstByteTimeout(t *testing.T) {
 	}
 }
 
+// TestRelayHeaderTimeoutMsDrivesResponseHeaderTimeout header_timeout_ms 驱动等响应头预算：
+// first_byte_timeout_ms 不再兼任等头超时——上游延迟吐头（>first_byte、<header_timeout）应成功
+func TestRelayHeaderTimeoutMsDrivesResponseHeaderTimeout(t *testing.T) {
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// 延迟 300ms 才吐响应头：若等头预算误用 first_byte_timeout_ms(60ms) 会提前断开
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.HeaderTimeoutMs = 8000  // 等头预算 8s
+	policy.FirstByteTimeoutMs = 60 // 若被误用作等头预算则 60ms 即失败
+	setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("延迟吐头(300ms)应成功（header_timeout_ms=8s 驱动等头预算）: %s", w.Body.String())
+	}
+}
+
+// TestRelayRetryOnHeaderTimeoutMs header_timeout_ms 到期上游仍未吐响应头 → 连接失败 → 换号重试成功
+func TestRelayRetryOnHeaderTimeoutMs(t *testing.T) {
+	var hits int32
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// 第一次：连接成功后长时间不吐响应头（有界等待避免测试悬挂），
+			// Go 侧 ResponseHeaderTimeout（header_timeout_ms）到期即连接失败并换号重试
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	policy.HeaderTimeoutMs = 100 // 等头 100ms 到期即断（first_byte_timeout_ms 未参与）
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 3),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("header_timeout_ms 超时换号重试后客户端应收到成功内容: %s", w.Body.String())
+	}
+	cb := env.waitCallback(t)
+	if cb["account_id"] != float64(3) {
+		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
+	}
+}
+
 // TestRelayRetryOnIdleTimeout 心跳注释后上游空闲断开 → 注释行不算实质数据 → 仍可换号重试成功
 func TestRelayRetryOnIdleTimeout(t *testing.T) {
 	var hits int32

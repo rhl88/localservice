@@ -100,6 +100,7 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
     "proxy_ip": "1.2.3.4:8080",
     "retry_policy": {
       "max_retries": 3,
+      "header_timeout_ms": 60000,
       "first_byte_timeout_ms": 30000,
       "read_timeout_ms": 60000,
       "heartbeat_interval_ms": 10000,
@@ -128,8 +129,9 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 | 字段 | 说明 |
 |------|------|
 | `max_retries` | 换号重试上限（Go 重新回调决策接口时回传 tried_account_ids） |
-| `first_byte_timeout_ms` | 首字节超时，超时判定连接失败可重试（0=禁用） |
-| `read_timeout_ms` | 流空闲超时（无数据判定半开） |
+| `header_timeout_ms` | 等待上游响应头超时（http.Transport ResponseHeaderTimeout），须覆盖大上下文 prefill 的完整耗时，超时判定连接失败可重试（0=回退 `first_byte_timeout_ms` 兜底，兼容旧版应用未下发该字段的场景） |
+| `first_byte_timeout_ms` | 响应头之后首个数据字节前的空读上限（对齐 PHP 通道 read_timeout 检测语义，与 `read_timeout_ms` 取较小值；0=禁用该项） |
+| `read_timeout_ms` | 流空闲超时（首字节之后无数据判定半开） |
 | `heartbeat_interval_ms` | 活跃心跳间隔（向客户端发注释行保活，0=禁用） |
 | `first_byte_heartbeat_ms` | 首字节前心跳间隔（0=禁用） |
 | `long_task_threshold_ms` | 长流预警阈值（发 `event: notice`，0=禁用） |
@@ -211,7 +213,7 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 |------|------|
 | 本地短路 | 决策响应含 `local_response`（`{status, body}`）时直接写回客户端，不连上游、不回调日志——管理类端点（models 等）由 CmsPro 侧本地出数的通用机制 |
 | 请求体改写 | 决策响应含 `body_override` 时整体替换原始请求体转发上游（如模型别名解析为真实 model_id）；换号重试时决策请求始终携带客户端**原始**请求体，改写不污染后续决策 |
-| 重试边界 | 未向客户端写出**实质数据**（SSE 注释行 ping/notice 不算，客户端无感）前，连接层失败（连接拒绝、构造请求失败、首字节超时、空闲超时、流读取失败）与上游 429/401/403/5xx 状态码均按 `retry_policy.max_retries` 重新回调决策接口换号重试；一旦开始写实质数据则不再重试，优雅收尾并回调 `failed` |
+| 重试边界 | 未向客户端写出**实质数据**（SSE 注释行 ping/notice 不算，客户端无感）前，连接层失败（连接拒绝、构造请求失败、等响应头超时、首数据超时、空闲超时、流读取失败）与上游 429/401/403/5xx 状态码均按 `retry_policy.max_retries` 重新回调决策接口换号重试；一旦开始写实质数据则不再重试，优雅收尾并回调 `failed` |
 | 心跳保活 | 首字节前按 `first_byte_heartbeat_ms`、活跃期按 `heartbeat_interval_ms` 向客户端发送 SSE 注释行（`: ping`），防止客户端/网关空闲断连；心跳不重置空闲超时计时（半开连接判定只看上游数据到达），避免上游挂死时心跳掩蔽超时 |
 | usage 提取 | 自定义跨块行扫描器解析 SSE 数据行中的 `usage` 字段，兼容上游分块切割 JSON 行的情况 |
 | 非 2xx 响应体 | 上游错误响应体（JSON）作为 `error_message` 回传给 PHP 日志接口，供账号维护判定 |
@@ -239,3 +241,4 @@ curl -N -X POST http://127.0.0.1:9501/open/llm/cline/v1/chat/completions ^
 |------|------|------|
 | 1.0.0 | 2026-09-18 | 首版。Go 侧通用透传处理器（`/open/llm/{app}/*`）+ 两接口契约 + CmsproClineproxy 参考实现 |
 | 1.1.2 | 2026-09-18 | 故障无感切换增强：连接层失败（连接失败/首字节超时/空闲超时/流读取失败）与心跳后失败均标记可换号重试（此前仅上游状态码可重试，连接失败直接终止）；心跳不再重置空闲计时，修复半开连接永不判定导致客户端等至自行断开（「客户端中断」频发根因之一）；`interrupted` 统一归类 `error_kind=client` |
+| 1.1.6 | 2026-09-20 | 超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底兼容旧版应用）；`first_byte_timeout_ms` 回归真实语义——响应头之后首个数据字节前的空读上限（与 read_timeout_ms 取较小值），不再兼任等头超时；修复大上下文 prefill 期间等头预算被错配为 10s/30s 导致的「http2: timeout awaiting response headers」高频失败 |
