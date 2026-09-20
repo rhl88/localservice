@@ -609,3 +609,122 @@ func TestRelayRetryOnIdleTimeout(t *testing.T) {
 		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
 	}
 }
+
+// TestRelayStripNonStandardFields 非标准字段过滤（对齐 PHP sanitizeChunk）：
+// 上游 chunk 携带 provider/native_finish_reason/service_tier 时不透传客户端，
+// 干净行原样透传（delta 空对象保真、思考字段保留）
+func TestRelayStripNonStandardFields(t *testing.T) {
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		// 含全部非标准字段的 chunk（顶层 + choices 内）
+		fmt.Fprint(w, "data: {\"id\":\"c1\",\"provider\":\"cline\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\",\"reasoning\":\"思考\"},\"native_finish_reason\":\"stop\"}]}\n\n")
+		flusher.Flush()
+		// 干净 chunk + 空对象 delta（finish_reason chunk）——应原样透传
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n")
+		flusher.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	})
+
+	env := setup(t, dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k", policyZero(), 1))
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	respBody := w.Body.String()
+	for _, banned := range []string{`"provider"`, `"service_tier"`, `"native_finish_reason"`} {
+		if strings.Contains(respBody, banned) {
+			t.Fatalf("客户端输出不应含非标准字段 %s: %s", banned, respBody)
+		}
+	}
+	// 实质内容与思考字段保留、空对象 delta 保真、[DONE] 收尾
+	if !strings.Contains(respBody, "你好") || !strings.Contains(respBody, `"reasoning":"思考"`) {
+		t.Fatalf("内容/思考字段应透传: %s", respBody)
+	}
+	if !strings.Contains(respBody, `"delta":{}`) {
+		t.Fatalf("空对象 delta 应保真为 {}: %s", respBody)
+	}
+	if !strings.Contains(respBody, "[DONE]") {
+		t.Fatalf("应收到结束标记: %s", respBody)
+	}
+	cb := env.waitCallback(t)
+	if cb["status"] != "success" {
+		t.Fatalf("回调 status = %v, 期望 success", cb["status"])
+	}
+}
+
+// TestRelayZeroOutputFails 零字节流判失败（对齐 PHP「故障被当成成功」修复）：
+// 上游 200 后立即关闭 → failed，未输出实质数据可换号重试，重试成功则客户端无感
+func TestRelayZeroOutputFails(t *testing.T) {
+	var hits int32
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// 第一次：仅下发响应头立即关闭（零字节零行）
+			w.Header().Set("Content-Type", "text/event-stream")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 2),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("零输出换号重试后客户端应收到成功内容: %s", w.Body.String())
+	}
+	cb := env.waitCallback(t)
+	if cb["status"] != "success" || cb["account_id"] != float64(2) {
+		t.Fatalf("回调 status = %v account_id = %v, 期望 success/2", cb["status"], cb["account_id"])
+	}
+}
+
+// TestRelayZeroContentChunksFail 空内容流判失败：上游只发无实质内容的 chunk
+// （空 delta、无 usage、无 finish_reason）即关闭，同属「故障被当成成功」盲区
+func TestRelayZeroContentChunksFail(t *testing.T) {
+	var hits int32
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			// 仅空 delta 初始 chunk，无任何实质内容
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+
+	policy := policyZero()
+	policy.MaxRetries = 2
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 2),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Fatalf("空内容换号重试后客户端应收到成功内容: %s", w.Body.String())
+	}
+	cb := env.waitCallback(t)
+	if cb["status"] != "success" || cb["account_id"] != float64(2) {
+		t.Fatalf("回调 status = %v account_id = %v, 期望 success/2", cb["status"], cb["account_id"])
+	}
+}

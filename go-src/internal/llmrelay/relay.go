@@ -5,6 +5,7 @@
 // 再以 goroutine 流式转发上游响应，流结束后回调「日志接口」落库。
 //
 // 路由约定（在 api/server.go 注册）：
+//
 //	POST/GET /open/llm/{app}/v1/*path   app 为应用对外 API 前缀名（如 cline）
 //	GET      /open/llm/ping             健康检查
 //
@@ -340,12 +341,37 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 	// 的空读上限」语义，prefill 期间不再受等头预算双重挤压）
 	headersAt := time.Now()
 	activity := headersAt // 上游最近一次数据到达时间（仅上游数据更新，心跳不计入）
-	lastPing := start    // 上次心跳写出时间（独立计时，不掩蔽空闲超时）
+	lastPing := start     // 上次心跳写出时间（独立计时，不掩蔽空闲超时）
 	firstByte := false
-	wrote := false // 是否已向客户端写出过数据
+	wrote := false      // 是否已向客户端写出过数据
+	sawContent := false // 是否见过实质内容 chunk（content/reasoning/tool_calls/finish_reason）
 	longTaskNotified := false
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+
+	// pending 行缓冲 + 输出闸门：chunk 可能跨行切断，按行缓冲后逐行过滤写出。
+	// 首个实质内容 chunk 到达前（sawContent=false），数据行只缓冲不输出——
+	// 上游若零输出即关闭，缓冲整体丢弃、未向客户端写出任何实质数据，
+	// 可换号重试（对齐 PHP 通道「故障被当成成功」修复的无感切换语义）；
+	// 闸门打开后缓冲行随当前流一并输出
+	pending := make([]byte, 0, 64*1024)
+	emit := func(chunk []byte, content bool) error {
+		pending = append(pending, chunk...)
+		for {
+			idx := bytes.IndexByte(pending, '\n')
+			if idx < 0 {
+				return nil
+			}
+			if !content && !sawContent {
+				return nil // 闸门未开：保留行待实质内容到达后一并输出
+			}
+			line := pending[:idx+1] // 含行尾换行
+			pending = pending[idx+1:]
+			if _, err := w.Write(sanitizeSSELine(line)); err != nil {
+				return err
+			}
+		}
+	}
 
 	var lastResult scanResult
 
@@ -353,34 +379,57 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 		select {
 		case chunk, ok := <-dataCh:
 			if !ok {
-				// 上游关闭：EOF 视为正常结束
+				// 上游关闭：EOF 视为正常结束——但零输出视为上游故障
+				// （对齐 PHP 通道「故障被当成成功」修复：整条流无任何
+				// 实质内容 chunk 时判失败，避免调用日志把故障记成成功）；
+				// 未向客户端输出实质数据时缓冲整体丢弃，可换号重试
 				if err := <-errCh; err != nil && err != io.EOF {
 					// 未输出实质数据时标记可重试（主循环按 wroteToClient 拦截已输出场景）
 					return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
 						errMessage: "上游读取失败: " + err.Error(), errKind: "upstream"}
 				}
-				// 处理行缓冲残留
-				if r := sc.flush(); r.promptTokens != nil || r.completionTokens != nil {
-					lastResult = r
+				if sawContent {
+					// 处理行缓冲残留（最后一行无换行结尾）
+					if len(pending) > 0 {
+						if _, werr := w.Write(sanitizeSSELine(pending)); werr != nil {
+							return &streamResult{status: "interrupted", wroteToClient: wrote, errKind: "client",
+								errMessage: "客户端写入失败: " + werr.Error()}
+						}
+						pending = nil
+					}
+					if r := sc.flush(); r.promptTokens != nil || r.completionTokens != nil {
+						lastResult = r
+					}
+					return &streamResult{
+						status: "success", promptTokens: lastResult.promptTokens,
+						completionTok: lastResult.completionTokens, totalTokens: lastResult.totalTokens,
+						finishReason: lastResult.finishReason,
+					}
 				}
-				return &streamResult{
-					status: "success", promptTokens: lastResult.promptTokens,
-					completionTok: lastResult.completionTokens, totalTokens: lastResult.totalTokens,
-					finishReason: lastResult.finishReason,
-				}
+				// 零输出：行缓冲残留不输出（保持未写出实质数据状态）
+				return &streamResult{status: "failed", wroteToClient: wrote, retryable: true,
+					errMessage: "上游零输出（连接建立后未返回任何实质内容）", errKind: "upstream",
+					promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
+					totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
 			}
 			activity = time.Now()
 			firstByte = true
-			if r := sc.feed(chunk); r.promptTokens != nil || r.completionTokens != nil {
+			r := sc.feed(chunk)
+			if r.promptTokens != nil || r.completionTokens != nil {
 				lastResult = r
 			}
-			if _, err := w.Write(chunk); err != nil {
+			if r.hasContent {
+				sawContent = true
+			}
+			if err := emit(chunk, r.hasContent); err != nil {
 				return &streamResult{status: "interrupted", wroteToClient: true, errKind: "client",
 					errMessage: "客户端写入失败: " + err.Error()}
 			}
-			wrote = true
-			if flusher != nil {
-				flusher.Flush()
+			if sawContent {
+				wrote = true
+				if flusher != nil {
+					flusher.Flush()
+				}
 			}
 
 		case <-ticker.C:
@@ -426,7 +475,7 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 
 		case <-ctx.Done():
 			return &streamResult{status: "interrupted", wroteToClient: wrote, errKind: "client",
-				errMessage: "客户端中断",
+				errMessage:   "客户端中断",
 				promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
 				totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
 		}
@@ -532,6 +581,7 @@ type scanResult struct {
 	completionTokens *int64
 	totalTokens      *int64
 	finishReason     string
+	hasContent       bool // 本批次是否见过实质内容（content/reasoning/tool_calls/finish_reason）
 }
 
 func (s *lineScanner) feed(chunk []byte) scanResult {
@@ -550,7 +600,10 @@ func (s *lineScanner) consume(final bool) scanResult {
 		if idx < 0 {
 			if final && len(s.buf) > 0 {
 				if r := scanLine(s.buf); r.promptTokens != nil || r.completionTokens != nil {
+					r.hasContent = r.hasContent || out.hasContent
 					out = r
+				} else if r.hasContent {
+					out.hasContent = true
 				}
 				s.buf = nil
 			}
@@ -559,21 +612,22 @@ func (s *lineScanner) consume(final bool) scanResult {
 		line := s.buf[:idx]
 		s.buf = s.buf[idx+1:]
 		if r := scanLine(line); r.promptTokens != nil || r.completionTokens != nil {
+			r.hasContent = r.hasContent || out.hasContent
 			out = r
+		} else if r.hasContent {
+			out.hasContent = true
 		}
 	}
 }
 
-// scanLine 扫描单行 SSE 数据：粗筛 "usage" 后解析（上游值以最后一行为准）
+// scanLine 扫描单行 SSE 数据：粗筛 data 行后解析（usage 以最后一行为准）。
+// hasContent 累计不覆盖（多行或运算），usage/finish_reason 保留最后值
 func scanLine(line []byte) scanResult {
-	if !bytes.Contains(line, []byte(`"usage"`)) {
-		// finish_reason 无 usage 时也需记录
-		if bytes.Contains(line, []byte(`"finish_reason"`)) {
-			data, ok := trimSSEData(line)
-			if ok {
-				return parseChunk(data)
-			}
-		}
+	// 粗筛：仅含 delta/finish_reason/usage 的数据行值得 JSON 解析
+	// （[DONE]、注释行、event 行、错误对象行直接跳过）
+	if !(bytes.Contains(line, []byte(`"delta"`)) ||
+		bytes.Contains(line, []byte(`"finish_reason"`)) ||
+		bytes.Contains(line, []byte(`"usage"`))) {
 		return scanResult{}
 	}
 	data, ok := trimSSEData(line)
@@ -592,11 +646,70 @@ func trimSSEData(line []byte) ([]byte, bool) {
 	return bytes.TrimSpace(t[5:]), true
 }
 
-// parseChunk 解析 SSE chunk JSON，提取 usage / finish_reason
+// sseStrippedTopFields SSE 数据行的顶层非标准字段（对齐 PHP 通道 sanitizeChunk）。
+// delta.reasoning / delta.reasoning_details（思考过程）不过滤，透传给支持
+// 思考字段的客户端（Cherry Studio、DeepSeek 系等）
+var sseStrippedTopFields = []string{"provider", "native_finish_reason", "service_tier"}
+
+// sanitizeSSELine 对 SSE 数据行剔除非标准字段（对齐 PHP 通道 sanitizeChunk：
+// 顶层 provider/native_finish_reason/service_tier 与 choices 内
+// native_finish_reason），避免严格按 OpenAI 规范解析的客户端（Cline SDK /
+// Rust serde 等）报 error decoding response body。
+// 仅当行实际含非标准字段时才经 map 重组输出，否则原样返回——原始字节透传
+// 保证 delta 空对象与字段顺序完全保真；重组时 Go 空 map 序列化为 {}，
+// 同样保真空对象（无 PHP 关联数组解码陷阱）
+func sanitizeSSELine(line []byte) []byte {
+	data, ok := trimSSEData(line)
+	if !ok || len(data) == 0 || data[0] != '{' {
+		return line // 非 data 行 / [DONE] / 非对象载荷原样透传
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return line
+	}
+	changed := false
+	for _, k := range sseStrippedTopFields {
+		if _, exists := m[k]; exists {
+			delete(m, k)
+			changed = true
+		}
+	}
+	if choices, ok := m["choices"].([]interface{}); ok {
+		for _, c := range choices {
+			if cm, ok := c.(map[string]interface{}); ok {
+				if _, exists := cm["native_finish_reason"]; exists {
+					delete(cm, "native_finish_reason")
+					changed = true
+				}
+			}
+		}
+	}
+	if !changed {
+		return line
+	}
+	nb, err := json.Marshal(m)
+	if err != nil {
+		return line
+	}
+	out := make([]byte, 0, len(nb)+8)
+	out = append(out, []byte("data: ")...)
+	out = append(out, nb...)
+	out = append(out, '\n')
+	return out
+}
+
+// parseChunk 解析 SSE chunk JSON，提取 usage / finish_reason / 实质内容标记
 func parseChunk(data []byte) scanResult {
 	var out scanResult
 	var chunk struct {
 		Choices []struct {
+			Delta struct {
+				Content          interface{} `json:"content"`
+				ReasoningContent interface{} `json:"reasoning_content"`
+				Reasoning        interface{} `json:"reasoning"`
+				ToolCalls        interface{} `json:"tool_calls"`
+				FunctionCall     interface{} `json:"function_call"`
+			} `json:"delta"`
 			FinishReason interface{} `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *struct {
@@ -613,6 +726,14 @@ func parseChunk(data []byte) scanResult {
 		out.completionTokens = chunk.Usage.CompletionTokens
 		out.totalTokens = chunk.Usage.TotalTokens
 	}
+	for _, c := range chunk.Choices {
+		if meaningful(c.Delta.Content) || meaningful(c.Delta.ReasoningContent) ||
+			meaningful(c.Delta.Reasoning) || meaningful(c.Delta.ToolCalls) ||
+			meaningful(c.Delta.FunctionCall) || meaningful(c.FinishReason) {
+			out.hasContent = true
+			break
+		}
+	}
 	if len(chunk.Choices) > 0 {
 		switch v := chunk.Choices[0].FinishReason.(type) {
 		case string:
@@ -620,6 +741,23 @@ func parseChunk(data []byte) scanResult {
 		}
 	}
 	return out
+}
+
+// meaningful 判定 JSON 值是否为实质内容：nil/空串/空数组/空对象为否，
+// 其余（非空串、非空数组/对象、数字、布尔）为是
+func meaningful(v interface{}) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case string:
+		return t != ""
+	case []interface{}:
+		return len(t) > 0
+	case map[string]interface{}:
+		return len(t) > 0
+	default:
+		return true
+	}
 }
 
 // extractModelAndStream 从请求体提取 model 与 stream 标记
@@ -713,12 +851,21 @@ func setSSEHeaders(w http.ResponseWriter) {
 	h.Set("X-Accel-Buffering", "no")
 }
 
-// writeSSEError 以 SSE error chunk 形式返回错误（保证严格客户端可解析）
+// writeSSEError 以 SSE error chunk 形式返回错误（保证严格客户端可解析）。
+// 格式对齐 PHP 通道 formatSseError：错误事件同时携带 choices 字段（空 delta
+// + finish_reason stop）——部分严格按 OpenAI 规范反序列化的客户端（Cline SDK /
+// Rust serde 等）解析每个 data: 行时要求 choices 存在，仅有 error 会解码失败
+// （error decoding response body）
 func writeSSEError(w http.ResponseWriter, flusher http.Flusher, msg string) {
 	payload, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": msg,
-			"type":    "upstream_error",
+			"type":    "api_error",
+			"param":   nil,
+			"code":    nil,
+		},
+		"choices": []map[string]interface{}{
+			{"index": 0, "delta": map[string]interface{}{}, "finish_reason": "stop"},
 		},
 	})
 	fmt.Fprintf(w, "data: %s\n\n", payload)

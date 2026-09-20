@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.1.6 | 更新日期：2026-09-20
-> 应用版本：1.1.6 | 应用 ID：cmspro.localservice
+> 版本：1.1.7 | 更新日期：2026-09-20
+> 应用版本：1.1.7 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -145,3 +145,4 @@
 | 1.1.3 | 2026-09-18 | PHP 侧 disable_functions 兼容修复：架构检测改用 php_uname()、shell 调用统一安全封装（ServiceManager::safeShellExec）；基于应用 v1.1.3 |
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固（宝塔系统加固场景）：自动检测并临时解除 `/etc/systemd/system` 及既有 unit 文件的 `chattr +i`，操作完成后恢复；基于应用 v1.1.4 |
 | 1.1.6 | 2026-09-20 | 透传超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底）；`first_byte_timeout_ms` 回归真实语义（响应头后首数据空读上限，与 read_timeout_ms 取较小值），修复大上下文 prefill 期间「http2: timeout awaiting response headers」误判；基于应用 v1.1.6 |
+| 1.1.7 | 2026-09-20 | 透传兼容性补齐：① 零输出判定——上游 200 后未产出实质内容 chunk（content/reasoning/tool_calls/finish_reason 均无）即关闭判 `failed` 可换号重试，首个实质 chunk 前数据行仅缓冲不输出；② SSE 非标准字段过滤——剔除顶层 `provider`/`native_finish_reason`/`service_tier` 与 choices 内 `native_finish_reason`（对齐 PHP 通道 sanitizeChunk），干净行原始字节透传；③ 错误 chunk 兼容格式——错误 data 行同时携带 `choices`（空 delta + finish_reason stop，对齐 PHP formatSseError）；④ 决策请求 `body` 以原始字节上送、应用侧对象模式解码保真嵌套空对象（契约说明补充）；基于应用 v1.1.7 |

@@ -1,6 +1,6 @@
 # 本地服务 应用文档
 
-> 应用ID：`cmspro.localservice` | 文档版本：1.0.0 | 应用版本：1.1.6 | 依赖：PHP ≥ 8.1, CmsPro ≥ 5.0.0
+> 应用ID：`cmspro.localservice` | 文档版本：1.0.0 | 应用版本：1.1.7 | 依赖：PHP ≥ 8.1, CmsPro ≥ 5.0.0
 
 - 官方地址：https://www.cmspro.cn/apps/cmspro.localservice
 - 本应用是 CmsPro v5 的本地系统服务应用，基于 CMSPRO 运行，请先安装 [CMSPRO](https://www.cmspro.cn/help/2)
