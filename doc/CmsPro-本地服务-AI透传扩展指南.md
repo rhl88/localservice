@@ -175,7 +175,7 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 
 | 字段 | 说明 |
 |------|------|
-| `status` | `success` 流完整结束 / `interrupted` 客户端中断 / `failed` 上游失败（Go 已按 retry_policy 重试穷尽后） |
+| `status` | `success` 流完整结束 / `interrupted` 客户端中断 / `failed` 上游失败（**每次尝试均回调**：换号重试前的中间尝试同步回调即时归因，最终失败为重试穷尽后回调） |
 | `error_kind` | 错误归类：`auth`(401/403)、`rate_limit`(429)、`upstream`(5xx/读取失败)、`connect`(连接失败)、`timeout`(空闲超时)、`client`(客户端中断)、空=成功 |
 | `usage` 三字段 | 来自上游 `stream_options.include_usage` 报告值；上游未返回时为 0 |
 
@@ -214,6 +214,9 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 | 本地短路 | 决策响应含 `local_response`（`{status, body}`）时直接写回客户端，不连上游、不回调日志——管理类端点（models 等）由 CmsPro 侧本地出数的通用机制 |
 | 请求体改写 | 决策响应含 `body_override` 时整体替换原始请求体转发上游（如模型别名解析为真实 model_id）；换号重试时决策请求始终携带客户端**原始**请求体，改写不污染后续决策。决策请求的 `body` 以原始字节（RawMessage）上送，应用侧改写时应**对象模式解码**（PHP `json_decode($raw)` stdClass）保真嵌套空对象——关联数组解码会把 `tools[].function.parameters:{}` 等空对象变形为 `[]`，严格上游（JSON Schema 校验）直接 400 |
 | 重试边界 | 未向客户端写出**实质数据**（SSE 注释行 ping/notice 不算，客户端无感）前，连接层失败（连接拒绝、构造请求失败、等响应头超时、首数据超时、空闲超时、流读取失败）与上游 429/401/403/5xx 状态码均按 `retry_policy.max_retries` 重新回调决策接口换号重试；一旦开始写实质数据则不再重试，优雅收尾并回调 `failed` |
+| 中间尝试回调 | 换号重试前对**每次失败尝试同步回调** `log-callback`（对应各自的 dispatch_id 租约），应用侧即时归因（429 冷却 / 401 禁用 / 402 池级冷却 / 出口失败计数）——对齐 PHP 通道「每轮失败立即 markFailure」，后续请求不再撞刚失败的账号/出口；一次客户端请求最多产生 N+1 条调用日志（每次尝试一条），粒度为「每次上游调用」 |
+| 429 重试节流 | 上游 429 换号重试前固定喘息 1s（对齐 PHP 通道）：限流多为分钟级窗口配额（TPM/RPM），立即重试必然再撞同一窗口；喘息期间客户端中断则提前收尾（该次失败已回调） |
+| 429 消息注解 | 上游 429 错误消息按错误码语义化注解（TPM/RPM 归类 + Key 冷却恢复预期 + 扩充 Key 池/分流建议，对齐 PHP 通道 annotateRateLimitMessage），客户端错误 chunk 与日志回调一致；未识别的 429 变体原样透传 |
 | 心跳保活 | 首字节前按 `first_byte_heartbeat_ms`、活跃期按 `heartbeat_interval_ms` 向客户端发送 SSE 注释行（`: ping`），防止客户端/网关空闲断连；心跳不重置空闲超时计时（半开连接判定只看上游数据到达），避免上游挂死时心跳掩蔽超时 |
 | usage 提取 | 自定义跨块行扫描器解析 SSE 数据行中的 `usage` 字段，兼容上游分块切割 JSON 行的情况 |
 | 零输出判定 | 上游 200 后未产出任何实质内容 chunk（content/reasoning/tool_calls/finish_reason 均无）即关闭 → 判 `failed`（`error_kind=upstream`）而非 success，避免故障被当成成功；首个实质内容 chunk 到达前的数据行仅缓冲不输出，零输出时缓冲整体丢弃，保持「未写出实质数据」状态可换号重试（对齐 PHP 通道同款修复） |
@@ -246,3 +249,4 @@ curl -N -X POST http://127.0.0.1:9501/open/llm/cline/v1/chat/completions ^
 | 1.1.2 | 2026-09-18 | 故障无感切换增强：连接层失败（连接失败/首字节超时/空闲超时/流读取失败）与心跳后失败均标记可换号重试（此前仅上游状态码可重试，连接失败直接终止）；心跳不再重置空闲计时，修复半开连接永不判定导致客户端等至自行断开（「客户端中断」频发根因之一）；`interrupted` 统一归类 `error_kind=client` |
 | 1.1.6 | 2026-09-20 | 超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底兼容旧版应用）；`first_byte_timeout_ms` 回归真实语义——响应头之后首个数据字节前的空读上限（与 read_timeout_ms 取较小值），不再兼任等头超时；修复大上下文 prefill 期间等头预算被错配为 10s/30s 导致的「http2: timeout awaiting response headers」高频失败 |
 | 1.1.7 | 2026-09-20 | 透传兼容性补齐（对齐 PHP 通道既有行为）：零输出判失败（整条流无实质内容 chunk 时 failed 而非 success，闸门式缓冲保证未输出前可换号重试）；SSE 数据行过滤非标准字段（provider/native_finish_reason/service_tier，干净行原始字节透传保真）；错误 chunk 携带 choices 兼容格式（对齐 formatSseError）；决策请求 body 原始字节上送契约明确（应用侧对象模式解码保真嵌套空对象） |
+| 1.1.8 | 2026-09-20 | 429 无感切换对齐 PHP 通道：换号重试前对每次失败尝试**同步回调** `log-callback`（应用侧即时归因冷却，后续请求不再撞刚失败的账号/出口）；429 重试前固定喘息 1s（分钟级限流窗口内立即重试必然再撞）；429 错误消息语义化注解（TPM/RPM 归类 + 恢复指引，对齐 annotateRateLimitMessage） |

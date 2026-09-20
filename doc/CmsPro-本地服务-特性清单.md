@@ -1,7 +1,7 @@
 # CmsPro-本地服务-特性清单
 
-> 版本：1.1.7 | 更新日期：2026-09-20
-> 应用版本：1.1.7 | 应用 ID：cmspro.localservice
+> 版本：1.1.8 | 更新日期：2026-09-20
+> 应用版本：1.1.8 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -18,7 +18,7 @@
 | 安装卸载 | `Install.php` 处理安装/卸载/升级 | `Install.php` |
 | 三终端 | 后台（admin） | `ServiceProvider::registerRoutes()` |
 | Go 服务 | 独立常驻 Go 服务（Windows 服务/Linux daemon）承担实际执行 | `Bin/`、`go-src/` |
-| AI 透传扩展 | 通用 LLM 流式透传处理器：Go 承接 SSE 双向转发（goroutine 不占 php-cgi worker），PHP 保留决策/日志/账号维护；通用路由 `/open/llm/{app}/{prefix}/*path`，任意应用按契约接入；决策契约支持 `local_response` 本地短路、`body_override` 请求体改写（决策请求随 `body` 上送原始请求体，改写权在应用侧）；连接层失败（连接失败/超时/流中断）在未输出实质数据前自动换号重试，心跳不掩蔽空闲超时 | `go-src/internal/llmrelay/`、`doc/CmsPro-本地服务-AI透传扩展指南.md` |
+| AI 透传扩展 | 通用 LLM 流式透传处理器：Go 承接 SSE 双向转发（goroutine 不占 php-cgi worker），PHP 保留决策/日志/账号维护；通用路由 `/open/llm/{app}/{prefix}/*path`，任意应用按契约接入；决策契约支持 `local_response` 本地短路、`body_override` 请求体改写（决策请求随 `body` 上送原始请求体，改写权在应用侧）；连接层失败（连接失败/超时/流中断）在未输出实质数据前自动换号重试，换号前逐次同步回调即时归因（429 冷却/401 禁用/出口计数），429 重试前喘息 1s、错误消息语义化注解，心跳不掩蔽空闲超时 | `go-src/internal/llmrelay/`、`doc/CmsPro-本地服务-AI透传扩展指南.md` |
 
 ---
 
@@ -146,3 +146,4 @@
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固（宝塔系统加固场景）：自动检测并临时解除 `/etc/systemd/system` 及既有 unit 文件的 `chattr +i`，操作完成后恢复；基于应用 v1.1.4 |
 | 1.1.6 | 2026-09-20 | 透传超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底）；`first_byte_timeout_ms` 回归真实语义（响应头后首数据空读上限，与 read_timeout_ms 取较小值），修复大上下文 prefill 期间「http2: timeout awaiting response headers」误判；基于应用 v1.1.6 |
 | 1.1.7 | 2026-09-20 | 透传兼容性补齐：① 零输出判定——上游 200 后未产出实质内容 chunk（content/reasoning/tool_calls/finish_reason 均无）即关闭判 `failed` 可换号重试，首个实质 chunk 前数据行仅缓冲不输出；② SSE 非标准字段过滤——剔除顶层 `provider`/`native_finish_reason`/`service_tier` 与 choices 内 `native_finish_reason`（对齐 PHP 通道 sanitizeChunk），干净行原始字节透传；③ 错误 chunk 兼容格式——错误 data 行同时携带 `choices`（空 delta + finish_reason stop，对齐 PHP formatSseError）；④ 决策请求 `body` 以原始字节上送、应用侧对象模式解码保真嵌套空对象（契约说明补充）；基于应用 v1.1.7 |
+| 1.1.8 | 2026-09-20 | 429 无感切换对齐 PHP 通道：① 换号重试前每次失败尝试同步回调 `log-callback`，应用侧即时归因（429 冷却/401 禁用/402 池级冷却/出口失败计数），后续请求不再撞刚失败的账号/出口；② 429 重试前固定喘息 1s（分钟级限流窗口内立即重试必然再撞）；③ 429 错误消息语义化注解（TPM/RPM 归类 + Key 冷却恢复预期 + 扩充 Key 池/分流建议，对齐 PHP annotateRateLimitMessage）；基于应用 v1.1.8 |

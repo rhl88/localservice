@@ -119,6 +119,20 @@ func sseServer(t *testing.T, handler func(w http.ResponseWriter, r *http.Request
 	return srv
 }
 
+// waitIntermediateFailure 消费并断言一条中间尝试的失败回调（换号重试前的
+// 同步回调：失败即时归因，先于下一次决策与最终结果到达）
+func waitIntermediateFailure(t *testing.T, e *testEnv, wantAccount int64) map[string]interface{} {
+	t.Helper()
+	cb := e.waitCallback(t)
+	if cb["status"] != "failed" {
+		t.Fatalf("中间回调 status = %v, 期望 failed", cb["status"])
+	}
+	if cb["account_id"] != float64(wantAccount) {
+		t.Fatalf("中间回调 account_id = %v, 期望 %d", cb["account_id"], wantAccount)
+	}
+	return cb
+}
+
 // policyZero 返回全禁用的重试策略（无心跳/无超时，测试稳定）
 func policyZero() RetryPolicy {
 	return RetryPolicy{}
@@ -181,8 +195,12 @@ func TestRelayStreamSuccess(t *testing.T) {
 	}
 }
 
-// TestRelayRetryOn429 上游 429 → 未写客户端 → 换号重试成功
+// TestRelayRetryOn429 上游 429 → 未写客户端 → 中间尝试同步回调归因 → 换号重试成功
 func TestRelayRetryOn429(t *testing.T) {
+	origBackoff := rateLimitBackoff
+	rateLimitBackoff = 10 * time.Millisecond // 缩短喘息等待
+	t.Cleanup(func() { rateLimitBackoff = origBackoff })
+
 	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		// 两种凭证区分两次尝试：第一次 429，第二次成功
 		if r.Header.Get("Authorization") == "Bearer bad-key" {
@@ -219,9 +237,61 @@ func TestRelayRetryOn429(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	// 中间尝试同步回调：429 即时归因（PHP 侧冷却该 Key），先于第二次决策到达
+	intermediate := env.waitCallback(t)
+	if intermediate["account_id"] != float64(1) || intermediate["error_kind"] != "rate_limit" {
+		t.Fatalf("中间回调 account_id/error_kind = %v/%v, 期望 1/rate_limit",
+			intermediate["account_id"], intermediate["error_kind"])
+	}
+	if intermediate["status"] != "failed" {
+		t.Fatalf("中间回调 status = %v, 期望 failed", intermediate["status"])
+	}
+	// 最终成功回调：第二个账号
+	final := env.waitCallback(t)
+	if final["account_id"] != float64(3) {
+		t.Fatalf("最终回调 account_id = %v, 期望 3（第二个账号）", final["account_id"])
+	}
+	if final["status"] != "success" {
+		t.Fatalf("最终回调 status = %v, 期望 success", final["status"])
+	}
+}
+
+// TestRelay429MessageAnnotation 429 错误消息语义化注解：客户端错误 chunk
+// 与日志回调均携带 TPM/RPM 归类与恢复指引
+func TestRelay429MessageAnnotation(t *testing.T) {
+	origBackoff := rateLimitBackoff
+	rateLimitBackoff = 10 * time.Millisecond
+	t.Cleanup(func() { rateLimitBackoff = origBackoff })
+
+	upstream := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error":{"message":"[insufficient_quota] inference exceeds tpm/rpm limit"}}`)
+	})
+
+	// 两次尝试均 429（MaxRetries=1：1 次原始 + 1 次重试）→ 终局透出注解后的错误
+	policy := policyZero()
+	policy.MaxRetries = 1
+	env := setup(t,
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k1", policy, 1),
+		dispatchOK(t, upstream.URL+"/v1/chat/completions", "Bearer k2", policy, 2),
+	)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/open/llm/cline/v1/chat/completions", strings.NewReader(body))
+	relay(w, r, "cline", "chat/completions", []byte(body))
+
+	for _, want := range []string{"账号分钟级配额限流", "Key 已自动冷却", "扩充 Key 池"} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Fatalf("客户端错误 chunk 应含注解文案 %q: %s", want, w.Body.String())
+		}
+	}
 	cb := env.waitCallback(t)
-	if cb["account_id"] != float64(3) {
-		t.Fatalf("回调 account_id = %v, 期望 3（第二个账号）", cb["account_id"])
+	if cb["error_kind"] != "rate_limit" {
+		t.Fatalf("回调 error_kind = %v, 期望 rate_limit", cb["error_kind"])
+	}
+	if !strings.Contains(fmt.Sprint(cb["error_message"]), "账号分钟级配额限流") {
+		t.Fatalf("回调 error_message 应含注解文案: %v", cb["error_message"])
 	}
 }
 
@@ -446,6 +516,7 @@ func TestRelayRetryOnConnectError(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("连接失败换号重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["account_id"] != float64(3) {
 		t.Fatalf("回调 account_id = %v, 期望 3（第二个账号）", cb["account_id"])
@@ -486,6 +557,7 @@ func TestRelayRetryOnFirstByteTimeout(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("首字节超时换号重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["account_id"] != float64(3) {
 		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
@@ -554,6 +626,7 @@ func TestRelayRetryOnHeaderTimeoutMs(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("header_timeout_ms 超时换号重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["account_id"] != float64(3) {
 		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
@@ -604,6 +677,7 @@ func TestRelayRetryOnIdleTimeout(t *testing.T) {
 	if !strings.Contains(respBody, "ok") {
 		t.Fatalf("空闲超时换号重试后客户端应收到成功内容: %s", respBody)
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["account_id"] != float64(3) {
 		t.Fatalf("回调 account_id = %v, 期望 3", cb["account_id"])
@@ -686,6 +760,7 @@ func TestRelayZeroOutputFails(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("零输出换号重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["status"] != "success" || cb["account_id"] != float64(2) {
 		t.Fatalf("回调 status = %v account_id = %v, 期望 success/2", cb["status"], cb["account_id"])
@@ -723,6 +798,7 @@ func TestRelayZeroContentChunksFail(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "ok") {
 		t.Fatalf("空内容换号重试后客户端应收到成功内容: %s", w.Body.String())
 	}
+	waitIntermediateFailure(t, env, 1)
 	cb := env.waitCallback(t)
 	if cb["status"] != "success" || cb["account_id"] != float64(2) {
 		t.Fatalf("回调 status = %v account_id = %v, 期望 success/2", cb["status"], cb["account_id"])

@@ -195,7 +195,20 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 		// failed：可重试（未向客户端输出实质数据）且未达上限 → 换号重来
 		if res.retryable && !res.wroteToClient && attempt < d.RetryPolicy.MaxRetries {
 			tried = append(tried, d.AccountID)
-			result = res
+			// 中间尝试逐次同步回调：PHP 侧即时归因（429 冷却 / 401 禁用 /
+			// 出口失败计数），对齐 PHP 通道「每轮失败立即 markFailure」的
+			// 调度健康度语义——后续请求不再撞刚失败的 Key/出口
+			callbackSync(app, d, res, model, stream)
+			// 429 重试节流：上游限流多为分钟级窗口配额（TPM/RPM），喘息前
+			// 立即重试必然再撞同一窗口，对齐 PHP 通道固定喘息 1s；
+			// 客户端中断时提前收尾（本次失败已回调，无需再回调）
+			if res.errKind == "rate_limit" {
+				select {
+				case <-time.After(rateLimitBackoff):
+				case <-r.Context().Done():
+					return
+				}
+			}
 			continue
 		}
 		// 不可重试或已输出：若尚未写出任何内容则补发错误 chunk
@@ -271,8 +284,13 @@ func forwardOnce(w http.ResponseWriter, r *http.Request, flusher http.Flusher,
 			resp.StatusCode == http.StatusUnauthorized ||
 			resp.StatusCode == http.StatusForbidden ||
 			resp.StatusCode >= 500
+		errMessage := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, msg)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// 对齐 PHP 通道 annotateRateLimitMessage：TPM/RPM 归类与恢复指引
+			errMessage = annotateRateLimitMessage(errMessage)
+		}
 		return &streamResult{status: "failed",
-			errMessage: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, msg),
+			errMessage: errMessage,
 			errKind:    statusErrKind(resp.StatusCode),
 			retryable:  retryable}
 	}
@@ -532,41 +550,74 @@ func callDispatch(ctx context.Context, app, authHeader, path string, model strin
 	return dr.Data, nil
 }
 
-// callbackAsync 异步回调日志接口（成功/失败/中断均回调；失败仅记录日志）
+// callbackSync 同步回调日志接口：阻塞至 PHP 侧处理完成（租约消费/Key 冷却
+// 生效）。用于换号重试前的中间尝试——确保失败归因先于下一次决策生效
+func callbackSync(app string, d *DispatchData, res *streamResult, model string, stream bool) {
+	doCallback(app, d, res, model, stream)
+}
+
+// callbackAsync 异步回调日志接口（最终结果收尾不阻塞客户端响应）
 func callbackAsync(app string, d *DispatchData, res *streamResult, model string, stream bool) {
+	go doCallback(app, d, res, model, stream)
+}
+
+// doCallback 回调日志接口（成功/失败/中断均回调；失败仅记录日志）
+func doCallback(app string, d *DispatchData, res *streamResult, model string, stream bool) {
 	if d == nil || d.DispatchID == "" {
 		return
 	}
-	go func() {
-		cfg := config.Get()
-		endpoint := strings.TrimRight(cfg.CmsproBaseURL, "/") + "/api/" + app + "/internal/log-callback"
-		payload := map[string]interface{}{
-			"dispatch_id":       d.DispatchID,
-			"status":            res.status,
-			"error_kind":        res.errKind,
-			"stream":            stream,
-			"model":             model,
-			"account_id":        d.AccountID,
-			"proxy_ip":          d.ProxyIP,
-			"prompt_tokens":     res.promptTokens,
-			"completion_tokens": res.completionTok,
-			"total_tokens":      res.totalTokens,
-			"error_message":     res.errMessage,
-		}
-		body, _ := json.Marshal(payload)
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-		if err != nil {
-			log.Printf("[llmrelay] 构造回调请求失败: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := internalClient().Do(req)
-		if err != nil {
-			log.Printf("[llmrelay] 日志回调失败 (dispatch=%s): %v", d.DispatchID, err)
-			return
-		}
-		resp.Body.Close()
-	}()
+	cfg := config.Get()
+	endpoint := strings.TrimRight(cfg.CmsproBaseURL, "/") + "/api/" + app + "/internal/log-callback"
+	payload := map[string]interface{}{
+		"dispatch_id":       d.DispatchID,
+		"status":            res.status,
+		"error_kind":        res.errKind,
+		"stream":            stream,
+		"model":             model,
+		"account_id":        d.AccountID,
+		"proxy_ip":          d.ProxyIP,
+		"prompt_tokens":     res.promptTokens,
+		"completion_tokens": res.completionTok,
+		"total_tokens":      res.totalTokens,
+		"error_message":     res.errMessage,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[llmrelay] 构造回调请求失败: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := internalClient().Do(req)
+	if err != nil {
+		log.Printf("[llmrelay] 日志回调失败 (dispatch=%s): %v", d.DispatchID, err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// rateLimitBackoff 429 换号重试前的喘息间隔（对齐 PHP 通道 429 切 Key 前
+// 固定喘息 1s；包级变量便于测试缩短等待）
+var rateLimitBackoff = time.Second
+
+// annotateRateLimitMessage 429 限流消息语义化注解（对齐 PHP 通道
+// ProxyService::annotateRateLimitMessage 文案）：按上游错误码归类为
+// 账号分钟级配额超限，标注恢复预期与处置建议；未识别的 429 变体
+// 原样返回，避免对未知形态附加误导性说明
+func annotateRateLimitMessage(msg string) string {
+	var reason string
+	switch {
+	case strings.Contains(msg, "ModelAccountTpmRateLimitExceeded"), strings.Contains(msg, "tpm exhausted"):
+		reason = "账号每分钟 Token 配额（TPM）超限"
+	case strings.Contains(msg, "ModelAccountRpmRateLimitExceeded"), strings.Contains(msg, "rpm exhausted"):
+		reason = "账号每分钟请求数（RPM）超限"
+	case strings.Contains(msg, "insufficient_quota"), strings.Contains(msg, "tpm/rpm limit"):
+		reason = "账号分钟级配额限流"
+	default:
+		return msg
+	}
+	return msg + "（" + reason + "：Key 已自动冷却，到点自动恢复；大上下文请求易触发，" +
+		"频繁出现请扩充 Key 池或将模型分流到其他 Provider）"
 }
 
 // ---------- 辅助 ----------
