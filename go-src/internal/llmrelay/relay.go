@@ -86,7 +86,7 @@ type streamResult struct {
 	finishReason  string
 	errMessage    string
 	errKind       string // 错误归类：auth | rate_limit | upstream | connect | timeout | client（空=无错误）
-	wroteToClient bool   // 是否已向客户端写出过实质数据（SSE 注释行 ping/notice 不算；决定能否换号重试）
+	wroteToClient bool   // 是否已向客户端写出过实质数据（SSE 注释行 ping 不算；决定能否换号重试）
 	retryable     bool   // 失败是否可换号重试（连接层失败与上游状态码语义）
 }
 
@@ -164,7 +164,7 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 			if flusher != nil {
 				writeSSEError(w, flusher, derr.Error())
 			}
-			callbackAsync(app, lastDispatch, result, model, stream)
+			callbackAsync(app, lastDispatch, result, model, stream, attempt+1)
 			return
 		}
 		lastDispatch = d
@@ -189,7 +189,7 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 
 		res := forwardOnce(w, r, flusher, d, path, body, model, stream)
 		if res.status == "success" || res.status == "interrupted" {
-			callbackAsync(app, d, res, model, stream)
+			callbackAsync(app, d, res, model, stream, attempt+1)
 			return
 		}
 		// failed：可重试（未向客户端输出实质数据）且未达上限 → 换号重来
@@ -198,13 +198,23 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 			// 中间尝试逐次同步回调：PHP 侧即时归因（429 冷却 / 401 禁用 /
 			// 出口失败计数），对齐 PHP 通道「每轮失败立即 markFailure」的
 			// 调度健康度语义——后续请求不再撞刚失败的 Key/出口
-			callbackSync(app, d, res, model, stream)
-			// 429 重试节流：上游限流多为分钟级窗口配额（TPM/RPM），喘息前
+			callbackSync(app, d, res, model, stream, attempt+1)
+			// 重试节流：429 上游限流多为分钟级窗口配额（TPM/RPM），喘息前
 			// 立即重试必然再撞同一窗口，对齐 PHP 通道固定喘息 1s；
-			// 客户端中断时提前收尾（本次失败已回调，无需再回调）
-			if res.errKind == "rate_limit" {
+			// 连接层失败（EOF/拒连）多为上游网关秒级~分钟级抖动窗口，立即
+			// 重试全部撞在窗口内穷尽失败（实测 20s 窗口内 4 轮全灭），指数
+			// 退避（2s/4s/8s）提高穿越概率，也降低高频建连触发上游风控的风险；
+			// 退避期间客户端中断提前收尾（本次失败已回调，无需再回调）
+			switch {
+			case res.errKind == "rate_limit":
 				select {
 				case <-time.After(rateLimitBackoff):
+				case <-r.Context().Done():
+					return
+				}
+			case res.errKind == "connect":
+				select {
+				case <-time.After(connectBackoff(attempt)):
 				case <-r.Context().Done():
 					return
 				}
@@ -215,7 +225,7 @@ func relay(w http.ResponseWriter, r *http.Request, app, path string, body []byte
 		if !res.wroteToClient && flusher != nil {
 			writeSSEError(w, flusher, res.errMessage)
 		}
-		callbackAsync(app, d, res, model, stream)
+		callbackAsync(app, d, res, model, stream, attempt+1)
 		return
 	}
 }
@@ -363,7 +373,6 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 	firstByte := false
 	wrote := false      // 是否已向客户端写出过数据
 	sawContent := false // 是否见过实质内容 chunk（content/reasoning/tool_calls/finish_reason）
-	longTaskNotified := false
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -481,19 +490,21 @@ func streamForward(w http.ResponseWriter, flusher http.Flusher, ctx context.Cont
 				}
 				lastPing = time.Now()
 			}
-			// 长任务预警（event: notice，与 PHP 通道格式一致）
-			if !longTaskNotified && policy.LongTaskThresholdMs > 0 &&
-				time.Since(start) > msDuration(policy.LongTaskThresholdMs) {
-				w.Write([]byte("event: notice\ndata: {\"type\":\"long_task\",\"message\":\"任务执行时间较长，请耐心等待\"}\n\n"))
-				if flusher != nil {
-					flusher.Flush()
-				}
-				longTaskNotified = true
-			}
+			// 不发 event: notice 长任务预警：data JSON 非标准 OpenAI chunk（无 choices/error），
+			// Cline 等严格客户端 zod 校验失败会直接断流；保活由上方 : ping 注释行承担
 
 		case <-ctx.Done():
+			// 中断文案携带输出时长与已产出 tokens：中断日志多为客户端取消且
+			// 占比高，同文案无区分度，需逐条点详情才能判断中断时机与损失
+			outMsg := "客户端中断"
+			elapsed := time.Since(start).Round(time.Second)
+			if lastResult.completionTokens != nil {
+				outMsg = fmt.Sprintf("客户端中断（输出 %s 后取消，已产出约 %d tokens）", elapsed, *lastResult.completionTokens)
+			} else if sawContent {
+				outMsg = fmt.Sprintf("客户端中断（输出 %s 后取消）", elapsed)
+			}
 			return &streamResult{status: "interrupted", wroteToClient: wrote, errKind: "client",
-				errMessage:   "客户端中断",
+				errMessage:   outMsg,
 				promptTokens: lastResult.promptTokens, completionTok: lastResult.completionTokens,
 				totalTokens: lastResult.totalTokens, finishReason: lastResult.finishReason}
 		}
@@ -551,18 +562,21 @@ func callDispatch(ctx context.Context, app, authHeader, path string, model strin
 }
 
 // callbackSync 同步回调日志接口：阻塞至 PHP 侧处理完成（租约消费/Key 冷却
-// 生效）。用于换号重试前的中间尝试——确保失败归因先于下一次决策生效
-func callbackSync(app string, d *DispatchData, res *streamResult, model string, stream bool) {
-	doCallback(app, d, res, model, stream)
+// 生效）。用于换号重试前的中间尝试——确保失败归因先于下一次决策生效，
+// 逐次落日志并携带尝试轮次
+func callbackSync(app string, d *DispatchData, res *streamResult, model string, stream bool, attempt int) {
+	doCallback(app, d, res, model, stream, attempt)
 }
 
 // callbackAsync 异步回调日志接口（最终结果收尾不阻塞客户端响应）
-func callbackAsync(app string, d *DispatchData, res *streamResult, model string, stream bool) {
-	go doCallback(app, d, res, model, stream)
+func callbackAsync(app string, d *DispatchData, res *streamResult, model string, stream bool, attempt int) {
+	go doCallback(app, d, res, model, stream, attempt)
 }
 
-// doCallback 回调日志接口（成功/失败/中断均回调；失败仅记录日志）
-func doCallback(app string, d *DispatchData, res *streamResult, model string, stream bool) {
+// doCallback 回调日志接口（成功/失败/中断均回调；失败仅记录日志）。
+// attempt 为本次尝试轮次（1=首轮，>1=换号重试的中间尝试），随日志落库
+// 用于区分一次客户端请求在日志列表产生的多条失败记录
+func doCallback(app string, d *DispatchData, res *streamResult, model string, stream bool, attempt int) {
 	if d == nil || d.DispatchID == "" {
 		return
 	}
@@ -572,6 +586,7 @@ func doCallback(app string, d *DispatchData, res *streamResult, model string, st
 		"dispatch_id":       d.DispatchID,
 		"status":            res.status,
 		"error_kind":        res.errKind,
+		"attempt":           attempt,
 		"stream":            stream,
 		"model":             model,
 		"account_id":        d.AccountID,
@@ -599,6 +614,16 @@ func doCallback(app string, d *DispatchData, res *streamResult, model string, st
 // rateLimitBackoff 429 换号重试前的喘息间隔（对齐 PHP 通道 429 切 Key 前
 // 固定喘息 1s；包级变量便于测试缩短等待）
 var rateLimitBackoff = time.Second
+
+// connectBackoff 连接层失败的换号重试指数退避（attempt 从 0 起）：
+// 2s/4s/8s 封顶，配合 max_retries=3 总退避 14s，可穿越秒级~20s 级上游抖动窗口
+func connectBackoff(attempt int) time.Duration {
+	d := 2 * time.Second << attempt
+	if d > 8*time.Second {
+		d = 8 * time.Second
+	}
+	return d
+}
 
 // annotateRateLimitMessage 429 限流消息语义化注解（对齐 PHP 通道
 // ProxyService::annotateRateLimitMessage 文案）：按上游错误码归类为
