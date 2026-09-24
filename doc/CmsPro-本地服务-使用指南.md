@@ -1,7 +1,7 @@
 # CmsPro-本地服务-使用指南
 
-> 版本：1.1.0 | 更新日期：2026-09-20
-> 应用版本：1.1.6 | 应用 ID：cmspro.localservice
+> 版本：1.2.1 | 更新日期：2026-09-25
+> 应用版本：1.2.1 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -72,7 +72,7 @@ php artisan app:install cmspro.localservice
 
 | 菜单 | 路径 | 验证要点 |
 |------|------|----------|
-| 仪表盘 | `/admin/cmspro/localservice/dashboard` | 服务状态、任务统计 |
+| 仪表盘 | `/admin/cmspro/localservice/dashboard` | 服务状态（真实版本号）、任务统计、有新版本时显示「更新」按钮 |
 | 任务记录 | `/admin/cmspro/localservice/tasks` | 任务列表（按 app_id 过滤） |
 | 日志查看 | `/admin/cmspro/localservice/logs` | 日志列表（按 level 过滤） |
 | 拓展管理 | `/admin/cmspro/localservice/extensions` | 拓展列表、配置、测试 |
@@ -81,9 +81,27 @@ php artisan app:install cmspro.localservice
 
 ### 3.3 服务状态验证
 
-在「仪表盘」页面查看服务状态，确认 Go 服务在线（HTTP 可达且 code=0）。
+在「仪表盘」页面查看服务状态，确认 Go 服务在线（HTTP 可达且 code=0）。「服务状态」卡片中的版本号为 Go 服务上报的真实版本号（编译时经 ldflags 注入 `buildinfo.Version`）。
 
-### 3.4 命令行管理
+### 3.4 服务在线更新
+
+当版本服务器（`https://v5.cmspro.cn`，由 Versionsvr 应用提供）发布了更新的本地服务版本时，「服务状态」卡片右侧自动显示「更新到 x.y.z」按钮：
+
+1. 点击按钮弹出确认框，展示当前版本、新版本号与更新日志
+2. 确认后进入**分段状态机执行**（避免单请求长耗时被网关超时中断 502）：
+   - `POST /service/update/start` 创建更新任务，返回 `run_id` 与任务信息
+   - 前端以 600ms 间隔循环调用 `POST /service/update/step` 推进步骤，弹窗实时显示进度（下载百分比/字节数、替换中、启动验证轮次）
+   - `GET /service/update/status` 读取任务状态，页面刷新后自动恢复轮询，不中断更新
+3. 步骤流转：`download`（单时间片下载，超时自动断点续传，完成后大小 + SHA256 校验）→ `replace`（停止服务 → 备份旧二进制 → 替换 → 发起启动）→ `verify`（单请求一轮健康探测，最多 5 轮）→ `finished` / `failed` 终态
+4. 新版本启动失败时自动回滚旧版本并重启，保证服务可用
+5. 服务离线时仅替换二进制文件并提示手动启动，不做停启操作
+6. 已有进行中的任务（60 秒内有心跳）时再次发起会返回 50014 并携带现有进度，防双跑
+
+> 平台自动识别：Windows amd64 / Linux amd64 / Linux arm64（按 `php_uname('m')` 判定）。更新耗时与二进制下载速度相关，每个分段请求最长约 15-20 秒，中途关闭弹窗/刷新页面不影响后台任务推进（重新打开页面会恢复轮询）。
+
+**PHP disable_functions 环境自动降级**：当 PHP 环境禁用 `exec/shell_exec`（宝塔等面板常见）或权限不足时，停服/启服命令自动降级**经本地 Go 服务执行**（Go 以系统服务身份运行，不受 PHP 函数禁用限制且权限更高）。因停止命令执行后 Go 进程随之退出，降级停止前会先布置「延迟启动」分离进程（`storage/app/localservice/delayed-start.bat|.sh`，10 秒后自动拉起服务），为文件替换留出时间窗口，启动验证轮询（约 20 秒）恰好覆盖——整个更新流程无需人工干预。仪表盘手动「停止」不布置延迟启动，服务保持停止状态。
+
+### 3.5 命令行管理
 
 Go 二进制支持以下子命令（需管理员权限）：
 
@@ -181,3 +199,5 @@ CmsproLocalservice/
 | 1.1.4 | 2026-09-18 | Linux 安装/卸载脚本兼容 systemd 目录 immutable 加固：宝塔等面板对 `/etc/systemd/system` 执行 `chattr +i` 后，root 写入/删除 unit 文件同样报 `Operation not permitted`；脚本现自动检测加固并临时解除、操作完成后恢复，同时处理已存在 unit 文件被加固导致覆盖或删除失败的情况，`chattr`/`lsattr` 缺失时静默降级 |
 | 1.1.5 | 2026-09-18 | 修复卸载重装后服务显示离线的问题：重装后 PHP 端 Token 重新生成，但 Go 配置文件与运行中进程仍持旧 Token 导致认证 401；现安装/升级时自动同步 Go 配置文件，「基本配置」保存、重新生成 Token/开放 API 密钥后也自动同步（此前保存操作不会同步，文档描述与实现不符） |
 | 1.1.6 | 2026-09-20 | 修复 Go 透传通道高频报「上游连接失败: http2: timeout awaiting response headers」的问题：等响应头预算此前误用 first_byte_timeout（10s/30s），大上下文 prefill 超过即失败；现决策契约新增 `header_timeout_ms`（对齐 PHP 通道 header_timeout=60s），first_byte_timeout 回归「响应头后首数据空读上限」语义。需各接入应用同步升级后生效 |
+| 1.2.0 | 2026-09-24 | 服务在线更新：Go 服务真实版本号经 ldflags 注入（`buildinfo.Version`），仪表盘「服务状态」显示真实版本；新增 UpdateService 对接版本服务器（v5.cmspro.cn）实现检查更新与应用更新（下载校验→停服→备份替换→重启→失败回滚），有新版本时仪表盘显示「更新」按钮一键升级。配套 Versionsvr 应用 v1.1.0 的「本地服务」版本发布功能使用 |
+| 1.2.1 | 2026-09-25 | 更新执行模式重构为分段状态机（修复一键更新 502）：原 apply 接口在单 HTTP 请求内同步完成下载→停服→替换→重启，大文件下载时被 Nginx/PHP-FPM 超时中断（502 Bad Gateway）；现拆分为 `update/start`（创建任务返回 run_id）+ `update/step`（前端 600ms 轮询单步推进）+ `update/status`（页面刷新恢复轮询）三接口，下载支持 15 秒时间片 + Range 断点续传，新增进行中任务防双跑（50014）与任务失效（50015）错误码 |

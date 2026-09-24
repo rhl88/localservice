@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"cmspro-local-service/internal/buildinfo"
 	"cmspro-local-service/internal/extension"
 	"cmspro-local-service/internal/storage"
 	"cmspro-local-service/internal/task"
@@ -26,7 +27,7 @@ func NewHandlers(db *storage.DB, taskMgr *task.Manager, extMgr *extension.Manage
 // Status 服务状态查询
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, map[string]interface{}{
-		"version": "1.0.0",
+		"version": buildinfo.Version,
 		"status":  "running",
 	})
 }

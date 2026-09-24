@@ -43,7 +43,11 @@
     <div class="dashboard-container">
         <!-- 左侧：服务状态卡片 -->
         <div class="card card-left">
-            <div class="card-header"><i class="fa fa-server"></i> 服务状态</div>
+            <div class="card-header"><i class="fa fa-server"></i> 服务状态
+                <span id="updateBtnWrap" style="margin-left:auto;display:none;">
+                    <button class="layui-btn layui-btn-sm layui-btn-warm" id="btnUpdate" title=""><i class="fa fa-arrow-circle-up"></i> <span id="updateBtnText">更新</span></button>
+                </span>
+            </div>
             <div class="card-body">
                 <div class="status-indicator">
                     <span class="status-dot" id="statusDot"></span>
@@ -343,10 +347,272 @@ layui.use(['table', 'layer', 'jquery'], function(){
         layer.msg('已刷新', {icon: 1, time: 1000});
     });
 
+    // ============ 本地服务在线更新 ============
+    var updateInfo = null;
+
+    // 检查更新：有新版本时在「服务状态」行右侧显示更新按钮
+    function checkUpdate() {
+        $('#updateBtnWrap').hide();
+        $.ajax({
+            url: API + '/service/update/check',
+            type: 'GET',
+            dataType: 'json',
+            success: function(res) {
+                if (res.code === 0 && res.data && res.data.has_update) {
+                    updateInfo = res.data;
+                    $('#updateBtnText').text('更新到 ' + res.data.latest_version);
+                    $('#btnUpdate').attr('title', (res.data.changelog || '').substring(0, 200));
+                    $('#updateBtnWrap').show();
+                }
+            }
+            // 检查失败静默：版本服务器不可达/服务离线时不打扰用户
+        });
+    }
+
+    // 发起更新（分段状态机：start 创建任务 → 循环 step 推进 → finished/failed 终态）
+    var updateRunning = false;
+    var updLayerIdx = null;
+
+    // 字节数格式化
+    function fmtBytes(n) {
+        n = parseInt(n, 10);
+        if (isNaN(n) || n < 0) return '-';
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        return (n / 1024 / 1024).toFixed(2) + ' MB';
+    }
+
+    // 关闭更新弹窗
+    function closeUpdateDialog() {
+        if (updLayerIdx !== null) {
+            layer.close(updLayerIdx);
+            updLayerIdx = null;
+        }
+    }
+
+    // 步骤节点（下载 → 替换 → 验证 → 完成）
+    function updStepNode(id, text, seq) {
+        return '<div class="upd-step" id="' + id + '">'
+            + '<div class="upd-step-dot">' + seq + '</div>'
+            + '<div class="upd-step-text">' + text + '</div></div>';
+    }
+
+    // 打开更新进度弹窗（步骤条 + 进度条 + 状态动画）
+    function openUpdateDialog() {
+        var html = '<style>'
+            + '@keyframes updSlide{0%{left:-40%}100%{left:100%}}'
+            + '.upd-steps{display:flex;align-items:center;margin-bottom:20px;}'
+            + '.upd-step{display:flex;flex-direction:column;align-items:center;gap:5px;min-width:46px;}'
+            + '.upd-step-dot{width:22px;height:22px;border-radius:50%;background:#eef1f6;color:#bbb;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;transition:all .3s;}'
+            + '.upd-step.active .upd-step-dot{background:#1e9fff;color:#fff;box-shadow:0 0 0 4px rgba(30,159,255,.15);}'
+            + '.upd-step.done .upd-step-dot{background:#52c41a;color:#fff;}'
+            + '.upd-step-text{font-size:12px;color:#999;white-space:nowrap;}'
+            + '.upd-step.active .upd-step-text{color:#1e9fff;font-weight:600;}'
+            + '.upd-step.done .upd-step-text{color:#52c41a;}'
+            + '.upd-step-line{flex:1;height:2px;background:#eef1f6;margin:0 8px 18px;transition:background .3s;}'
+            + '.upd-step-line.done{background:#52c41a;}'
+            + '</style>'
+            + '<div style="padding:20px 24px 18px;">'
+            + '<div class="upd-steps">'
+            + updStepNode('updStepDownload', '下载', '1')
+            + '<div class="upd-step-line"></div>'
+            + updStepNode('updStepReplace', '替换', '2')
+            + '<div class="upd-step-line"></div>'
+            + updStepNode('updStepVerify', '验证', '3')
+            + '<div class="upd-step-line"></div>'
+            + updStepNode('updStepDone', '完成', '<i class="fa fa-check"></i>')
+            + '</div>'
+            + '<div style="background:#eef1f6;border-radius:5px;height:10px;overflow:hidden;position:relative;">'
+            + '<div id="updBar" style="width:0%;height:100%;background:linear-gradient(90deg,#1e9fff,#4da8ff);border-radius:5px;transition:width .4s ease;"></div>'
+            + '<div id="updBarAnim" style="display:none;position:absolute;top:0;left:-40%;width:40%;height:100%;background:linear-gradient(90deg,transparent,rgba(30,159,255,.35),transparent);animation:updSlide 1.2s infinite linear;"></div>'
+            + '</div>'
+            + '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:13px;color:#666;">'
+            + '<span id="updStatus"><i class="fa fa-spinner fa-spin" style="color:#1e9fff;"></i> 准备下载...</span>'
+            + '<span id="updPercent" style="font-weight:600;color:#1e9fff;"></span>'
+            + '</div>'
+            + '<div id="updDetail" style="margin-top:4px;font-size:12px;color:#aaa;text-align:right;"></div>'
+            + '<div id="updError" style="display:none;margin-top:12px;padding:10px 12px;background:#fff2f0;border:1px solid #ffccc7;border-radius:4px;color:#ff4d4f;font-size:12px;line-height:1.7;"></div>'
+            + '</div>';
+        updLayerIdx = layer.open({
+            type: 1,
+            title: '<i class="fa fa-cloud-download" style="color:#1e9fff;"></i> 更新本地服务',
+            area: '440px',
+            content: html,
+            shade: [0.3, '#000'],
+            closeBtn: 2
+        });
+    }
+
+    // 按步骤状态渲染弹窗（对已关闭弹窗操作为 jQuery 空集，无害）
+    function renderUpdateUI(d) {
+        var order = ['download', 'replace', 'verify'];
+        var nodeIds = ['updStepDownload', 'updStepReplace', 'updStepVerify'];
+        var cur = order.indexOf(d.step);
+        var lines = $('.upd-step-line');
+
+        $.each(nodeIds, function(i, id) {
+            var $dot = $('#' + id);
+            $dot.removeClass('active done');
+            if (i < cur) {
+                $dot.addClass('done').find('.upd-step-dot').html('<i class="fa fa-check"></i>');
+            } else if (i === cur) {
+                $dot.addClass('active');
+            }
+        });
+        lines.removeClass('done');
+        for (var i = 0; i < cur; i++) {
+            lines.eq(i).addClass('done');
+        }
+        var $doneNode = $('#updStepDone');
+        $doneNode.removeClass('active done');
+        if (d.step === 'finished') {
+            $doneNode.addClass('done');
+        }
+
+        var $bar = $('#updBar'), $anim = $('#updBarAnim'), $pct = $('#updPercent');
+        var $status = $('#updStatus'), $detail = $('#updDetail'), $err = $('#updError');
+
+        if (d.step === 'download') {
+            var p = d.progress;
+            $bar.css('background', 'linear-gradient(90deg,#1e9fff,#4da8ff)').css('width', (p !== null ? p : 0) + '%');
+            $anim.show();
+            $pct.text(p !== null ? p + '%' : '');
+            $status.html('<i class="fa fa-spinner fa-spin" style="color:#1e9fff;"></i> 正在下载新版本 v' + d.version + '...');
+            $detail.text(fmtBytes(d.downloaded_bytes) + ' / ' + (d.expected_size > 0 ? fmtBytes(d.expected_size) : '未知大小'));
+        } else if (d.step === 'replace') {
+            $bar.css('background', 'linear-gradient(90deg,#faad14,#ffc53d)').css('width', '100%');
+            $anim.show();
+            $pct.text('');
+            $status.html('<i class="fa fa-refresh fa-spin" style="color:#faad14;"></i> 正在替换服务文件，服务将短暂停止...');
+            $detail.text('');
+        } else if (d.step === 'verify') {
+            $bar.css('background', 'linear-gradient(90deg,#52c41a,#73d13d)').css('width', '100%');
+            $anim.hide();
+            $pct.text('');
+            $status.html('<i class="fa fa-heartbeat" style="color:#52c41a;"></i> 正在验证新版本启动（第 ' + d.verify_round + '/5 轮）...');
+            $detail.text('');
+        } else if (d.step === 'finished') {
+            $bar.css('background', '#52c41a').css('width', '100%');
+            $anim.hide();
+            $pct.text('100%').css('color', '#52c41a');
+            $status.html('<i class="fa fa-check-circle" style="color:#52c41a;"></i> ' + (d.message || '更新完成'));
+            $detail.text('');
+        } else if (d.step === 'failed') {
+            $bar.css('background', '#ff4d4f').css('width', '100%');
+            $anim.hide();
+            $pct.text('失败').css('color', '#ff4d4f');
+            $status.html('<i class="fa fa-times-circle" style="color:#ff4d4f;"></i> 更新失败');
+            $detail.text('');
+            $err.show().html((d.message || '未知错误') + '<br><span style="color:#999;">可关闭此窗口，稍后在仪表盘重新发起更新。</span>');
+        }
+    }
+
+    // 循环驱动更新步骤直至终态
+    function runUpdateSteps(runId) {
+        openUpdateDialog();
+        var nextStep = function() {
+            $.ajax({
+                url: API + '/service/update/step',
+                type: 'POST',
+                dataType: 'json',
+                data: { run_id: runId },
+                timeout: 60000,
+                success: function(res) {
+                    var d = res.data;
+                    // 无状态数据的异常响应：直接终止
+                    if (!d || !d.step) {
+                        updateRunning = false;
+                        closeUpdateDialog();
+                        layer.msg(res.message || '更新失败', {icon: 2, time: 8000});
+                        return;
+                    }
+                    renderUpdateUI(d);
+                    if (d.step === 'finished') {
+                        updateRunning = false;
+                        $('#updateBtnWrap').hide();
+                        updateInfo = null;
+                        // 弹窗展示完成态 2 秒后自动关闭并刷新状态
+                        setTimeout(function() {
+                            closeUpdateDialog();
+                            layer.msg(d.message || '更新完成', {icon: 1, time: 2500});
+                            loadStatus();
+                            checkUpdate();
+                        }, 2000);
+                        return;
+                    }
+                    if (d.step === 'failed') {
+                        updateRunning = false;
+                        return;
+                    }
+                    // 未到终态：继续推进
+                    setTimeout(nextStep, 600);
+                },
+                error: function(xhr) {
+                    updateRunning = false;
+                    closeUpdateDialog();
+                    var msg = '更新请求失败';
+                    try { msg = JSON.parse(xhr.responseText).message || msg; } catch(e) {}
+                    layer.msg(msg, {icon: 2, time: 8000});
+                }
+            });
+        };
+        nextStep();
+    }
+
+    $('#btnUpdate').click(function() {
+        if (!updateInfo || updateRunning) return;
+        var html = '<div style="padding:10px 15px;line-height:1.8;">'
+            + '将把本地服务从 <b>' + updateInfo.current_version + '</b> 升级到 <b>' + updateInfo.latest_version + '</b>。'
+            + '<br>更新过程中服务会短暂停止并自动重启。'
+            + (updateInfo.changelog ? '<br><br><div style="background:#f8f8f8;border-radius:4px;padding:8px 10px;font-size:12px;color:#666;max-height:120px;overflow:auto;">' + updateInfo.changelog + '</div>' : '')
+            + '</div>';
+        layer.confirm(html, {icon: 3, title: '确认更新本地服务', area: '460px'}, function(index) {
+            layer.close(index);
+            updateRunning = true;
+            var loadIdx = layer.load(1, { content: '正在发起更新...' });
+            $.ajax({
+                url: API + '/service/update/start',
+                type: 'POST',
+                dataType: 'json',
+                timeout: 30000,
+                success: function(res) {
+                    layer.close(loadIdx);
+                    if (res.code !== 0 || !res.data || !res.data.run_id) {
+                        updateRunning = false;
+                        layer.msg(res.message || '发起更新失败', {icon: 2, time: 5000});
+                        return;
+                    }
+                    runUpdateSteps(res.data.run_id);
+                },
+                error: function(xhr) {
+                    layer.close(loadIdx);
+                    updateRunning = false;
+                    var msg = '发起更新失败';
+                    try { msg = JSON.parse(xhr.responseText).message || msg; } catch(e) {}
+                    layer.msg(msg, {icon: 2, time: 8000});
+                }
+            });
+        });
+    });
+
+    // 页面加载时恢复进行中的更新任务（刷新不中断）
+    $.ajax({
+        url: API + '/service/update/status',
+        type: 'GET',
+        dataType: 'json',
+        success: function(res) {
+            if (res.code === 0 && res.data && ['download', 'replace', 'verify'].indexOf(res.data.step) !== -1) {
+                updateRunning = true;
+                runUpdateSteps(res.data.run_id);
+            }
+        }
+    });
+
     // 初始化
     loadStatus();
     loadRecentTasks();
     startPoll();
+    checkUpdate();
 });
 </script>
 </body>

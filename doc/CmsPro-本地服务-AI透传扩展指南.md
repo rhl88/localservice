@@ -223,8 +223,9 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 | 非标准字段过滤 | 对 SSE 数据行剔除非标准字段（顶层 `provider`/`native_finish_reason`/`service_tier` 与 choices 内 `native_finish_reason`，对齐 PHP 通道 sanitizeChunk），避免严格客户端报 `error decoding response body`；仅含非标准字段的行才经 map 重组，干净行原始字节透传（delta 空对象与字段顺序完全保真）；`delta.reasoning`/`delta.reasoning_details`（思考过程）保留 |
 | 错误 chunk 兼容格式 | 错误以 SSE data 行下发且同时携带 `choices`（空 delta + finish_reason stop）——部分严格客户端（Cline SDK / Rust serde 等）解析每个 data: 行要求 choices 存在，仅有 error 会解码失败（对齐 PHP 通道 formatSseError） |
 | 非 2xx 响应体 | 上游错误响应体（JSON）作为 `error_message` 回传给 PHP 日志接口，供账号维护判定 |
-| 客户端中断 | 客户端断开时停止转发、通知上游关闭，回调 `status=interrupted`、`error_kind=client` |
+| 客户端中断 | 客户端断开时停止转发、通知上游关闭，回调 `status=interrupted`、`error_kind=client`；中断文案携带中断时机辅助排查：有 usage 时为「客户端中断（输出 Xs 后取消，已产出约 N tokens）」，无 usage 但已见实质内容时为「客户端中断（输出 Xs 后取消）」，首字节前中断保持「客户端中断」 |
 | 决策重试 | 决策接口 5xx/网络失败时 Go 短暂退避后重试（最多 3 次）；4xx 业务失败直接向客户端返回错误 |
+| 连接层失败重试退避 | 连接层失败（`error_kind=connect`，如 EOF/拒连）多为上游网关秒级~分钟级抖动窗口，换号重试前按指数退避（2s/4s/8s 封顶），配合 max_retries=3 总退避 14s 提高穿越概率，也降低高频建连触发上游风控的风险；退避期间客户端中断提前收尾；429 仍为固定喘息 1s，timeout 类失败不退避（换号本身有效且等待已长） |
 
 ## 六、验证
 
@@ -250,3 +251,5 @@ curl -N -X POST http://127.0.0.1:9501/open/llm/cline/v1/chat/completions ^
 | 1.1.6 | 2026-09-20 | 超时语义修正：retry_policy 契约新增 `header_timeout_ms`（等响应头预算，0=回退 first_byte_timeout_ms 兜底兼容旧版应用）；`first_byte_timeout_ms` 回归真实语义——响应头之后首个数据字节前的空读上限（与 read_timeout_ms 取较小值），不再兼任等头超时；修复大上下文 prefill 期间等头预算被错配为 10s/30s 导致的「http2: timeout awaiting response headers」高频失败 |
 | 1.1.7 | 2026-09-20 | 透传兼容性补齐（对齐 PHP 通道既有行为）：零输出判失败（整条流无实质内容 chunk 时 failed 而非 success，闸门式缓冲保证未输出前可换号重试）；SSE 数据行过滤非标准字段（provider/native_finish_reason/service_tier，干净行原始字节透传保真）；错误 chunk 携带 choices 兼容格式（对齐 formatSseError）；决策请求 body 原始字节上送契约明确（应用侧对象模式解码保真嵌套空对象） |
 | 1.1.8 | 2026-09-20 | 429 无感切换对齐 PHP 通道：换号重试前对每次失败尝试**同步回调** `log-callback`（应用侧即时归因冷却，后续请求不再撞刚失败的账号/出口）；429 重试前固定喘息 1s（分钟级限流窗口内立即重试必然再撞）；429 错误消息语义化注解（TPM/RPM 归类 + 恢复指引，对齐 annotateRateLimitMessage） |
+| 1.1.9 | 2026-09-24 | 中断日志文案增强：`interrupted` 回调的 `error_message` 携带中断时机——有 usage 时「客户端中断（输出 Xs 后取消，已产出约 N tokens）」、无 usage 但已见实质内容时「客户端中断（输出 Xs 后取消）」、首字节前保持「客户端中断」，中断日志占比高（客户端取消为主）时无需逐条点详情即可判断中断时机与损失 |
+| 1.1.10 | 2026-09-24 | 连接层失败重试退避：`error_kind=connect` 换号重试前加指数退避（2s/4s/8s 封顶）。根因：上游网关存在秒级~分钟级抖动窗口（实测 20s 窗口内 4 轮立即重试全灭、窗口期间仍有零星成功、窗口外四象限对照全通），立即换号重试全部撞在窗口内穷尽失败。退避提高穿越概率，也降低高频建连触发上游风控的风险。仅 connect 类退避，429 维持固定 1s，timeout 类不退避 |

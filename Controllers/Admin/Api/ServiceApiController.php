@@ -4,13 +4,15 @@ namespace App\Apps\CmsproLocalservice\Controllers\Admin\Api;
 
 use App\Apps\CmsproLocalservice\Services\LocalServiceClient;
 use App\Apps\CmsproLocalservice\Services\ServiceManager;
+use App\Apps\CmsproLocalservice\Services\UpdateService;
 use App\Http\Responses\ApiResponse;
 
 class ServiceApiController
 {
     public function __construct(
         private ServiceManager $manager,
-        private LocalServiceClient $client
+        private LocalServiceClient $client,
+        private UpdateService $updater
     ) {}
 
     /**
@@ -98,6 +100,51 @@ class ServiceApiController
         if ($res['code'] !== 0) {
             return ApiResponse::error($res['code'], $res['message']);
         }
+        return ApiResponse::success($res['data']);
+    }
+
+    /**
+     * 检查本地服务更新（对比版本服务器最新已发布版本）。
+     */
+    public function updateCheck()
+    {
+        $res = $this->updater->checkUpdate();
+        if ($res['code'] !== 0) {
+            return ApiResponse::error($res['code'], $res['message']);
+        }
+        return ApiResponse::success($res['data']);
+    }
+
+    /**
+     * 发起本地服务更新：校验环境并创建更新任务，返回 run_id 供前端分步驱动。
+     */
+    public function updateStart()
+    {
+        $res = $this->updater->startUpdate();
+        if ($res['code'] !== 0) {
+            return ApiResponse::error($res['code'], $res['message'], $res['data']);
+        }
+        return ApiResponse::success($res['data'], $res['message'] ?? null);
+    }
+
+    /**
+     * 执行更新任务的下一步（download/replace/verify 单步），前端循环调用直至终态。
+     */
+    public function updateStep(\Illuminate\Http\Request $request)
+    {
+        $res = $this->updater->stepUpdate((string) $request->input('run_id', ''));
+        if ($res['code'] !== 0) {
+            return ApiResponse::error($res['code'], $res['message'], $res['data']);
+        }
+        return ApiResponse::success($res['data'], $res['message'] ?? null);
+    }
+
+    /**
+     * 查询更新任务状态（无任务时 data 为 null，供页面刷新后恢复轮询）。
+     */
+    public function updateStatus()
+    {
+        $res = $this->updater->updateStatus();
         return ApiResponse::success($res['data']);
     }
 

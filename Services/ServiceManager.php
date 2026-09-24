@@ -71,6 +71,21 @@ class ServiceManager
     }
 
     /**
+     * 当前平台实际使用的 Go 二进制路径（含 Linux arm64 架构判定），
+     * 供更新服务定位待替换文件。与安装包装脚本的架构选择逻辑保持一致。
+     */
+    public function currentBinaryPath(): string
+    {
+        if ($this->isWindows()) {
+            return $this->binaryPath();
+        }
+        if (in_array(php_uname('m'), ['aarch64', 'arm64'], true)) {
+            return $this->appPath() . DIRECTORY_SEPARATOR . 'Bin' . DIRECTORY_SEPARATOR . 'linux' . DIRECTORY_SEPARATOR . 'cmspro-local-service-arm64';
+        }
+        return $this->binaryPath();
+    }
+
+    /**
      * 脚本输出目录（storage/app/localservice）。
      */
     protected function scriptDir(): string
@@ -322,19 +337,37 @@ class ServiceManager
     /**
      * 尝试启动服务。
      * Windows: sc start；Linux: systemctl start。
+     * $delayedStartPlanned：延迟启动进程已布置（更新流程经 Go 降级停止的场景），
+     * 此时服务将由延迟进程自动拉起，无需也无法再次主动启动，直接返回成功。
      */
-    public function start(): array
+    public function start(bool $delayedStartPlanned = false): array
     {
+        if ($delayedStartPlanned) {
+            return ['code' => 0, 'message' => '延迟启动进程已布置，等待服务自动拉起', 'data' => ['delayed_start' => true]];
+        }
         return $this->runServiceCommand('start');
     }
 
     /**
      * 尝试停止服务。
      * Windows: sc stop；Linux: systemctl stop。
+     * $withDelayedStart：更新场景传 true——停止前先布置延迟启动进程（仅经 Go 降级执行时需要），
+     * 供服务停止并完成文件替换后自动拉起新版本；仪表盘手动停止不传，服务保持停止状态。
      */
-    public function stop(): array
+    public function stop(bool $withDelayedStart = false): array
     {
-        return $this->runServiceCommand('stop');
+        $res = $this->runServiceCommand('stop');
+        if (in_array($res['code'], [403, 503], true)) {
+            // PHP 无执行函数或权限不足：降级经本地 Go 服务执行
+            // （Go 以系统服务运行，权限更高且不受 PHP disable_functions 限制）
+            $goRes = $this->runServiceCommandViaGo('stop', $withDelayedStart);
+            if ($goRes['code'] === 0) {
+                return $goRes;
+            }
+            // 降级失败：原 403 错误带命令输出详情（利于排查），优先保留
+            return $res['code'] === 403 ? $res : $goRes;
+        }
+        return $res;
     }
 
     /**
@@ -432,6 +465,100 @@ class ServiceManager
         }
 
         return ['code' => 0, 'message' => 'success', 'data' => ['output' => $output]];
+    }
+
+    /**
+     * PHP exec/shell_exec 不可用或权限不足时的降级路径：经本地 Go 服务执行服务管理命令。
+     * Go 服务以系统服务身份运行（Windows LocalSystem / Linux root），可执行 sc/systemctl。
+     *
+     * 注意：停止命令执行后 Go 服务进程随之退出，此后无法再经 Go 启动服务。
+     * 因此更新场景（$withDelayedStart=true）在停止前先布置「延迟启动」分离进程：
+     * 脚本 sleep 10 秒后执行启动命令，为文件替换留出时间窗口（更新状态机 verify 轮询约 20 秒可覆盖）。
+     */
+    protected function runServiceCommandViaGo(string $action, bool $withDelayedStart = false): array
+    {
+        $client = new LocalServiceClient();
+        if (!$client->isOnline()) {
+            return [
+                'code' => 503,
+                'message' => 'PHP 环境无法执行服务管理命令（exec/shell_exec 均不可用），且本地服务离线，无法降级执行。请通过生成的服务脚本手动操作',
+                'data' => null,
+            ];
+        }
+
+        // 更新场景：先布置延迟启动进程（Go 停止后无法再经 Go 启动服务）
+        $delayedStart = false;
+        if ($withDelayedStart) {
+            $scriptPath = $this->createDelayedStartScript();
+            if ($scriptPath === null) {
+                return ['code' => 500, 'message' => '创建延迟启动脚本失败（脚本目录不可写）', 'data' => null];
+            }
+            $command = $this->isWindows()
+                ? 'start "" /min "' . $scriptPath . '"'
+                : 'nohup bash ' . escapeshellarg($scriptPath) . ' >/dev/null 2>&1 &';
+            $launchRes = $client->exec('cmspro.localservice', 'system.exec', ['command' => $command], 15);
+            $exitCode = (int) ($launchRes['data']['exit_code'] ?? -1);
+            if (($launchRes['code'] ?? -1) !== 0 || $exitCode !== 0) {
+                return ['code' => 500, 'message' => '布置延迟启动进程失败：' . ($launchRes['message'] ?? ('退出码 ' . $exitCode)), 'data' => null];
+            }
+            $delayedStart = true;
+        }
+
+        // 经 Go 执行服务停止命令（Go 返回响应后随服务一起退出）
+        if ($this->isWindows()) {
+            $execRes = $client->exec('cmspro.localservice', 'service.stop', ['name' => $this->serviceName()], 15);
+            $output = (string) ($execRes['data']['output'] ?? '');
+        } else {
+            $execRes = $client->exec('cmspro.localservice', 'system.exec', [
+                'command' => 'systemctl stop ' . escapeshellarg($this->serviceName()),
+            ], 15);
+            $output = (string) ($execRes['data']['stdout'] ?? '');
+        }
+
+        if (($execRes['code'] ?? -1) !== 0) {
+            return ['code' => 500, 'message' => '经本地服务执行停止命令失败：' . ($execRes['message'] ?? '未知错误'), 'data' => null];
+        }
+
+        return [
+            'code' => 0,
+            'message' => 'success',
+            'data' => [
+                'output' => $this->ensureUtf8(trim($output)),
+                'delayed_start' => $delayedStart,
+            ],
+        ];
+    }
+
+    /**
+     * 生成延迟启动脚本（服务更新流程专用）：
+     * sleep 10 秒后执行启动命令——等待旧进程完全退出与文件替换完成。
+     *
+     * Windows 用 ping -n 11 计时（timeout 命令在无控制台 stdin 时会失败）；
+     * Linux 用 sleep。返回脚本绝对路径，创建失败返回 null。
+     */
+    protected function createDelayedStartScript(): ?string
+    {
+        $name = $this->serviceName();
+        if ($this->isWindows()) {
+            $path = $this->scriptDir() . DIRECTORY_SEPARATOR . 'delayed-start.bat';
+            $content = "@echo off\r\n"
+                . "rem 服务更新流程：延迟启动本地服务（等待旧进程退出与文件替换完成）\r\n"
+                . "ping -n 11 127.0.0.1 >nul\r\n"
+                . "sc start \"" . $name . "\"\r\n";
+        } else {
+            $path = $this->scriptDir() . DIRECTORY_SEPARATOR . 'delayed-start.sh';
+            $content = "#!/bin/bash\n"
+                . "# 服务更新流程：延迟启动本地服务（等待旧进程退出与文件替换完成）\n"
+                . "sleep 10\n"
+                . "systemctl start \"" . $name . "\"\n";
+        }
+        if (@file_put_contents($path, $content) === false) {
+            return null;
+        }
+        if (!$this->isWindows()) {
+            @chmod($path, 0755);
+        }
+        return $path;
     }
 
     /**
