@@ -224,11 +224,9 @@ layui.use(['layer', 'jquery', 'form'], function () {
             $('#swEnabled').prop('checked', !!d.enabled);
             form.render('checkbox');
 
-            // 端点地址：协议 + 主机 + 端口 + MCP 路径
-            var proto = location.protocol;
-            var host = location.hostname;
-            var endpoint = proto + '//' + host + ':' + '{{ (string) config("apps.cmspro.localservice.service_settings.port", "9501") }}' + (d.mcp_path || '');
-            $('#mcpEndpoint').text(endpoint);
+            // 端点地址：后端统一返回本机地址（127.0.0.1:端口 + MCP 路径），
+            // 不使用浏览器当前域名——本地服务仅监听 127.0.0.1
+            $('#mcpEndpoint').text(d.endpoint || '-');
 
             $('#mcpStatus').removeClass('on off').addClass(d.enabled ? 'on' : 'off');
             $('#mcpStatusText').text(d.enabled ? 'MCP 服务已启用 · 端点 ' + (d.mcp_path || '') : 'MCP 服务未启用（在「安全授权」中开启）');

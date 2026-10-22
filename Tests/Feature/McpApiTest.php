@@ -151,6 +151,11 @@ class McpApiTest extends LocalserviceTestCase
         // 前缀形如 /mcp-{12位随机}
         $this->assertMatchesRegularExpression('#^/mcp-[A-Za-z0-9]{12}$#', $prefix);
         $this->assertSame($prefix.'/mcp', $response->json('data.mcp_path'));
+
+        // 端点必须为本机地址（本地服务仅监听 127.0.0.1），不得使用站点域名
+        $endpoint = (string) $response->json('data.endpoint');
+        $this->assertMatchesRegularExpression('#^http://127\.0\.0\.1:\d+/mcp-#', $endpoint);
+        $this->assertStringNotContainsString((string) config('app.url', ''), $endpoint);
     }
 
     public function test_config_defaults(): void

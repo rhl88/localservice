@@ -237,6 +237,7 @@ class McpService
         }
 
         $allowlist = (string) $this->configItem(self::ITEM_IP_ALLOWLIST, '*');
+        $mcpPath = $pathPrefix.'/mcp';
 
         return [
             'enabled' => (int) $this->configItem(self::ITEM_ENABLED, 0) === 1,
@@ -244,7 +245,11 @@ class McpService
             'ip_allowlist' => $this->parseAllowlist($allowlist),
             'rate_limit_max' => (int) $this->configItem(self::ITEM_RATE_MAX, 300),
             'rate_limit_window' => (int) $this->configItem(self::ITEM_RATE_WINDOW, 60),
-            'mcp_path' => $pathPrefix.'/mcp',
+            'mcp_path' => $mcpPath,
+            // 完整端点固定为本机地址（127.0.0.1:端口）——本地服务仅监听 127.0.0.1，
+            // 站点域名不经代理无法到达该端口，且非本机 http 端点会被多数
+            // MCP 客户端的「非本机地址必须 https」安全策略拒绝
+            'endpoint' => app(ServiceManager::class)->relayBaseUrl().$mcpPath,
         ];
     }
 
