@@ -6,6 +6,7 @@ use App\Enums\Status;
 use App\Models\AdminRole;
 use App\Models\AdminUser;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 /**
@@ -14,6 +15,11 @@ use Tests\TestCase;
  * 说明：
  * 1. 应用迁移经 Install::install() 幂等建表并记录 migrations 表
  * 2. 应用 ServiceProvider 仅对已安装应用注册，测试环境需手动注册以加载路由
+ * 3. 禁止「无 fake 裸奔」的外发 HTTP（preventStrayRequests）——测试中的配置
+ *    下发（syncConfig→热重载）与状态探测本会打到本机真实 Go 服务（127.0.0.1:9501），
+ *    曾导致真实配置文件被测试数据污染。stray 请求抛出的异常会被服务侧
+ *    try-catch 正常降级为「服务不可用」分支，不影响既有测试语义。
+ *    注意：Http::fake 先注册的优先，测试内的精确 fake 不受本基类影响。
  */
 abstract class LocalserviceTestCase extends TestCase
 {
@@ -22,6 +28,8 @@ abstract class LocalserviceTestCase extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+
+        Http::preventStrayRequests();
 
         (new \App\Apps\CmsproLocalservice\Install())->install();
         $this->registerAppProvider();

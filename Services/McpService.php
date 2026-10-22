@@ -490,14 +490,46 @@ class McpService
     // ============ 配置下发 ============
 
     /**
-     * 把 MCP 配置写入 Go 服务配置文件（由 ServiceManager::syncConfig 统一落盘）。
+     * 把 MCP 配置写入 Go 服务配置文件并触发热重载（免重启生效）。
      *
      * 凭据以明文 Token 下发——Go 服务与本配置文件同在受保护的 storage 目录，
      * 且服务仅监听 127.0.0.1；令牌泄露风险由部署隔离与文件权限控制。
+     *
+     * 热重载失败不视为失败（配置已落盘，服务重启后仍会生效）——旧版本 Go 服务
+     * 无 /api/mcp/reload 端点时静默降级为「重启生效」。
      */
     public function syncConfig(): string
     {
-        return app(ServiceManager::class)->syncConfig();
+        $path = app(ServiceManager::class)->syncConfig();
+        $this->triggerHotReload();
+
+        return $path;
+    }
+
+    /**
+     * 触发 Go 服务配置热重载
+     */
+    protected function triggerHotReload(): bool
+    {
+        try {
+            $response = Http::baseUrl(app(ServiceManager::class)->relayBaseUrl())
+                ->withToken((string) $this->configItem('auth_token', ''))
+                ->timeout(5)
+                ->post('/api/mcp/reload');
+
+            if ($response->successful() && ($response->json('data.reloaded') ?? false)) {
+                return true;
+            }
+
+            Log::debug('MCP 配置热重载未成功（将随服务重启生效）', [
+                'status' => $response->status(),
+                'body' => mb_substr($response->body(), 0, 200),
+            ]);
+        } catch (\Throwable $e) {
+            Log::debug('MCP 配置热重载请求失败（将随服务重启生效）: '.$e->getMessage());
+        }
+
+        return false;
     }
 
     /**

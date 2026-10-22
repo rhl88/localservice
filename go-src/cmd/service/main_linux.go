@@ -141,6 +141,16 @@ func runForeground() {
 	}), nil)
 	handlers.SetMcp(mcpServer)
 
+	// MCP 配置热重载：PHP 后台变更下发后经 /api/mcp/reload 触发，免重启生效
+	handlers.SetMcpReloader(func() error {
+		fresh, err := config.Load(getConfigPath())
+		if err != nil {
+			return err
+		}
+		mcpServer.Reload(buildMcpConfig(fresh))
+		return nil
+	})
+
 	server := api.NewServer(handlers)
 	if err := server.Start(); err != nil {
 		log.Fatalf("HTTP 服务器启动失败: %v", err)

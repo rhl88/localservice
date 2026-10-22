@@ -60,6 +60,7 @@
 
 > Go 端使用 SQLite（`storage/local_service.db`）存储任务、日志、拓展数据，由 Go 服务自动创建与初始化。
 > MCP 凭据与访问控制配置真源在 PHP（数据库），经 `local_service_config.json` 的 `mcp` 段下发给 Go 服务；Go 侧只读使用，不本地持久化。
+> 配置下发后自动触发热重载（Go 1.2.0 `/api/mcp/reload`）：凭据与配置变更免重启即时生效；热重载失败（旧版 Go 服务）静默降级为重启生效。
 
 ---
 

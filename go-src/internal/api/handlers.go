@@ -15,10 +15,11 @@ import (
 
 // Handlers HTTP 请求处理器集合
 type Handlers struct {
-	db     *storage.DB
-	tasks  *task.Manager
-	extMgr *extension.Manager
-	mcp    *mcp.Server
+	db        *storage.DB
+	tasks     *task.Manager
+	extMgr    *extension.Manager
+	mcp       *mcp.Server
+	mcpReload func() error
 }
 
 // NewHandlers 创建 Handlers 实例
@@ -29,6 +30,11 @@ func NewHandlers(db *storage.DB, taskMgr *task.Manager, extMgr *extension.Manage
 // SetMcp 注入 MCP 服务（启动时装配，供路由与配置查询端点使用）
 func (h *Handlers) SetMcp(s *mcp.Server) {
 	h.mcp = s
+}
+
+// SetMcpReloader 注入 MCP 配置热重载回调（由 main 装配：重读配置文件并 Reload）
+func (h *Handlers) SetMcpReloader(fn func() error) {
+	h.mcpReload = fn
 }
 
 // McpTools MCP 工具清单查询（后台界面用）
@@ -59,6 +65,32 @@ func (h *Handlers) McpConfig(w http.ResponseWriter, r *http.Request) {
 		"default_timeout":   cfg.DefaultTimeout,
 		"max_concurrent":    cfg.MaxConcurrent,
 		"credential_count":  len(cfg.Credentials),
+	})
+}
+
+// McpReload 触发 MCP 配置热重载（PHP 后台配置下发后调用，内部认证保护）
+func (h *Handlers) McpReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "仅支持 POST 请求")
+		return
+	}
+	if h.mcp == nil {
+		writeError(w, 503, "MCP 服务未装配")
+		return
+	}
+	if h.mcpReload == nil {
+		writeError(w, 501, "热重载能力未装配，请重启本地服务使配置生效")
+		return
+	}
+	if err := h.mcpReload(); err != nil {
+		writeError(w, 500, "重载失败: "+err.Error())
+		return
+	}
+	writeSuccess(w, map[string]interface{}{
+		"reloaded":         true,
+		"mcp_path":         h.mcp.MCPPath(),
+		"enabled":          h.mcp.Enabled(),
+		"credential_count": h.mcp.CredentialCount(),
 	})
 }
 

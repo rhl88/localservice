@@ -36,6 +36,8 @@ func NewServer(handlers *Handlers) *Server {
 	// MCP 工具清单与配置查询（后台界面用，内部认证）
 	mux.HandleFunc("/api/mcp/tools", handlers.McpTools)
 	mux.HandleFunc("/api/mcp/config", handlers.McpConfig)
+	// MCP 配置热重载（PHP 后台配置下发后触发，内部认证）
+	mux.HandleFunc("/api/mcp/reload", handlers.McpReload)
 
 	// 开放 API 路由（X-API-Key 认证）
 	// 供第三方跨服务器调用，仅暴露任务执行能力

@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,17 +91,22 @@ func (c *Config) Normalize(reg *Registry) {
 	}
 }
 
-// Server MCP 协议服务
-type Server struct {
-	registry  *Registry
+// serverSnapshot 不可变运行快照（热重载时整体原子替换，读侧无锁）
+type serverSnapshot struct {
 	config    *Config
 	store     *CredentialStore
 	allowlist *IPAllowlist
-	limiter   *RateLimiter
-	confirm   *ConfirmGate
-	info      ServerInfo
-	audit     AuditSink
-	now       func() time.Time
+}
+
+// Server MCP 协议服务
+type Server struct {
+	registry *Registry
+	snap     atomic.Pointer[serverSnapshot]
+	limiter  *RateLimiter
+	confirm  *ConfirmGate
+	info     ServerInfo
+	audit    AuditSink
+	now      func() time.Time
 }
 
 // AuditSink 审计日志接收端（由本地服务 storage 实现；可空）
@@ -126,13 +132,10 @@ func NewServer(reg *Registry, cfg *Config, version string, audit AuditSink) *Ser
 	}
 	cfg.Normalize(reg)
 
-	return &Server{
-		registry:  reg,
-		config:    cfg,
-		store:     NewCredentialStore(cfg.Credentials),
-		allowlist: NewIPAllowlist(cfg.IPAllowlist),
-		limiter:   NewRateLimiter(cfg.RateLimitMax, cfg.RateLimitWindow),
-		confirm:   NewConfirmGate(ConfirmTTL * time.Second),
+	s := &Server{
+		registry: reg,
+		limiter:  NewRateLimiter(cfg.RateLimitMax, cfg.RateLimitWindow),
+		confirm:  NewConfirmGate(ConfirmTTL * time.Second),
 		info: ServerInfo{
 			Name:    "cmspro-local-service",
 			Version: version,
@@ -140,25 +143,38 @@ func NewServer(reg *Registry, cfg *Config, version string, audit AuditSink) *Ser
 		audit: audit,
 		now:   time.Now,
 	}
+	s.snap.Store(&serverSnapshot{
+		config:    cfg,
+		store:     NewCredentialStore(cfg.Credentials),
+		allowlist: NewIPAllowlist(cfg.IPAllowlist),
+	})
+	return s
 }
 
+// snapshot 当前运行快照
+func (s *Server) snapshot() *serverSnapshot { return s.snap.Load() }
+
 // Enabled 是否启用
-func (s *Server) Enabled() bool { return s.config.Enabled }
+func (s *Server) Enabled() bool { return s.snapshot().config.Enabled }
 
 // PathPrefix 路由前缀
-func (s *Server) PathPrefix() string { return s.config.PathPrefix }
+func (s *Server) PathPrefix() string { return s.snapshot().config.PathPrefix }
 
 // MCPPath 完整 MCP 端点路径
-func (s *Server) MCPPath() string { return s.config.PathPrefix + "/mcp" }
+func (s *Server) MCPPath() string { return s.snapshot().config.PathPrefix + "/mcp" }
 
 // Config 当前配置（只读，供本地管理接口展示）
-func (s *Server) Config() *Config { return s.config }
+func (s *Server) Config() *Config { return s.snapshot().config }
+
+// CredentialCount 有效凭据数（含停用与过期，供管理端点展示）
+func (s *Server) CredentialCount() int { return s.snapshot().store.Count() }
 
 // ServeHTTP 处理 MCP 端点请求
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := s.now()
+	snap := s.snapshot()
 
-	if !s.config.Enabled {
+	if !snap.config.Enabled {
 		writeRPCError(w, http.StatusServiceUnavailable, nil, -32000, "MCP 服务未启用")
 		return
 	}
@@ -171,7 +187,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := extractClientIP(r)
 
 	// 1. IP 白名单
-	if !s.allowlist.IsAllowed(clientIP) {
+	if !snap.allowlist.IsAllowed(clientIP) {
 		s.auditLog(clientIP, "", "-", "denied", "ip not allowed", start)
 		writeRPCError(w, http.StatusForbidden, nil, -32000, "IP 不在白名单内")
 		return
@@ -179,7 +195,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 2. 凭据鉴权
 	token := extractBearer(r)
-	cred := s.store.FindByToken(token)
+	cred := snap.store.FindByToken(token)
 	if cred == nil || !cred.Active || cred.IsExpired(s.now()) {
 		s.auditLog(clientIP, "", "-", "denied", "unauthorized", start)
 		w.Header().Set("WWW-Authenticate", "Bearer")

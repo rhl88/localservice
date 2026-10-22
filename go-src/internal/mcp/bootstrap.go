@@ -36,6 +36,48 @@ func NewServerFrom(bc *BootstrapConfig, version string, audit AuditSink, registr
 		log.Printf("[mcp] 内置工具注册异常: %v", err)
 	}
 
+	cfg := bootstrapConfigToConfig(bc, reg)
+	srv := NewServer(reg, cfg, version, audit)
+
+	if cfg.Enabled {
+		log.Printf("[mcp] MCP 服务已启用，端点 %s（工具 %d 个，凭据 %d 个）",
+			srv.MCPPath(), reg.Count(), srv.CredentialCount())
+	} else {
+		log.Printf("[mcp] MCP 服务未启用")
+	}
+	return srv
+}
+
+// Reload 热更新运行配置（PHP 后台变更下发后由 /api/mcp/reload 端点触发）。
+//
+// 原子替换配置、凭据与白名单——进行中的请求继续使用旧快照直至完成，
+// 新请求立即使用新配置。限流计数与确认门保持不变：前者避免重载被利用
+// 绕过限流，后者不中断进行中的高危操作确认流程。
+func (s *Server) Reload(bc *BootstrapConfig) {
+	reg := s.registry
+	if reg == nil {
+		reg = DefaultRegistry()
+	}
+	if err := registerBuiltinToolsIdempotent(reg); err != nil {
+		log.Printf("[mcp] 热重载时内置工具注册异常: %v", err)
+	}
+
+	cfg := bootstrapConfigToConfig(bc, reg)
+	s.snap.Store(&serverSnapshot{
+		config:    cfg,
+		store:     NewCredentialStore(cfg.Credentials),
+		allowlist: NewIPAllowlist(cfg.IPAllowlist),
+	})
+
+	if cfg.Enabled {
+		log.Printf("[mcp] 配置已热重载，端点 %s（凭据 %d 个）", s.MCPPath(), s.CredentialCount())
+	} else {
+		log.Printf("[mcp] 配置已热重载，MCP 服务未启用")
+	}
+}
+
+// bootstrapConfigToConfig 把引导配置转换为运行配置（NewServerFrom 与 Reload 共用）
+func bootstrapConfigToConfig(bc *BootstrapConfig, reg *Registry) *Config {
 	cfg := DefaultConfig()
 	if bc != nil {
 		cfg.Enabled = bc.Enabled
@@ -51,16 +93,8 @@ func NewServerFrom(bc *BootstrapConfig, version string, audit AuditSink, registr
 		cfg.MaxConcurrent = bc.MaxConcurrent
 		cfg.Credentials = bc.Credentials
 	}
-
-	srv := NewServer(reg, cfg, version, audit)
-
-	if cfg.Enabled {
-		log.Printf("[mcp] MCP 服务已启用，端点 %s（工具 %d 个，凭据 %d 个）",
-			srv.MCPPath(), reg.Count(), srv.store.Count())
-	} else {
-		log.Printf("[mcp] MCP 服务未启用")
-	}
-	return srv
+	cfg.Normalize(reg)
+	return cfg
 }
 
 // registerBuiltinToolsIdempotent 注册内置工具，已存在的跳过

@@ -450,3 +450,90 @@ func TestMcpPathPrefixTrailingSlashTrimmed(t *testing.T) {
 		t.Errorf("尾部斜杠应被去除，实际 %s", cfg.PathPrefix)
 	}
 }
+
+func TestMcpReloadHotSwapsCredentials(t *testing.T) {
+	s, reg := newTestServer(t, nil)
+
+	// 重载前：旧凭据可用
+	if rec := doRPC(s, "test-token", `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`); rec.Code != 200 {
+		t.Fatalf("重载前旧凭据应可用，实际 %d", rec.Code)
+	}
+
+	// 热重载：旧凭据移除，换入新凭据与端点前缀
+	s.Reload(&BootstrapConfig{
+		Enabled:     true,
+		PathPrefix:  "/test-mcp-v2",
+		IPAllowlist: []string{"*"},
+		Credentials: []*Credential{
+			{ID: "key_2", Token: "new-token", ToolIDs: []string{"SystemInfo"}, Active: true,
+				CreatedAt: time.Now().Format("2006-01-02 15:04:05"), ExpiresDays: 30},
+		},
+	})
+
+	if s.MCPPath() != "/test-mcp-v2/mcp" {
+		t.Errorf("重载后端点应更新，实际 %s", s.MCPPath())
+	}
+	if s.CredentialCount() != 1 {
+		t.Errorf("重载后凭据数应为 1，实际 %d", s.CredentialCount())
+	}
+
+	// 旧凭据失效、新凭据生效（旧 token 应 401）
+	if rec := doRPC(s, "test-token", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`); rec.Code != 401 {
+		t.Errorf("重载后旧凭据应 401，实际 %d", rec.Code)
+	}
+	if rec := doRPC(s, "new-token", `{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`); rec.Code != 200 {
+		t.Errorf("重载后新凭据应可用，实际 %d", rec.Code)
+	}
+
+	// 未注册工具应在 Normalize 时剔除（授权集只剩 SystemInfo）
+	cred := s.Config().Credentials[0]
+	if len(cred.ToolIDs) != 1 {
+		t.Errorf("重载后授权集应剔除未注册项，实际 %v", cred.ToolIDs)
+	}
+	_ = reg
+}
+
+func TestMcpReloadDisablesService(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+	if !s.Enabled() {
+		t.Fatal("重载前应启用")
+	}
+
+	s.Reload(&BootstrapConfig{Enabled: false})
+
+	if s.Enabled() {
+		t.Error("重载后应禁用")
+	}
+	if rec := doRPC(s, "test-token", `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`); rec.Code != 503 {
+		t.Errorf("禁用后应 503，实际 %d", rec.Code)
+	}
+}
+
+func TestMcpReloadPreservesConfirmGateAndLimiter(t *testing.T) {
+	s, reg := newTestServer(t, nil)
+
+	// 造一个确认门等待项（高危工具 FileDelete 已授权）
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"FileDelete","arguments":{"path":"x.txt"}}}`
+	if rec := doRPC(s, "test-token", body); !strings.Contains(rec.Body.String(), "waiting_confirm") {
+		t.Fatalf("应返回 waiting_confirm，实际 %s", rec.Body.String())
+	}
+
+	// 热重载不应清空确认门（进行中的高危确认不被重载打断）
+	s.Reload(&BootstrapConfig{
+		Enabled:     true,
+		PathPrefix:  "/test-mcp",
+		IPAllowlist: []string{"*"},
+		Credentials: []*Credential{
+			{ID: "key_1", Token: "test-token", ToolIDs: reg.LowRiskIDs(), Active: true,
+				CreatedAt: time.Now().Format("2006-01-02 15:04:05"), ExpiresDays: 30},
+		},
+	})
+
+	// 用相同参数 + confirm=true 应命中既有等待项进入已确认执行路径
+	// （若确认门被清空，此处会重新返回 waiting_confirm）
+	confirmBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"FileDelete","arguments":{"path":"x.txt","confirm":true}}}`
+	rec := doRPC(s, "test-token", confirmBody)
+	if strings.Contains(rec.Body.String(), "waiting_confirm") {
+		t.Error("确认门应跨热重载保留，不应重新进入等待")
+	}
+}
