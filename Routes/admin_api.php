@@ -2,6 +2,7 @@
 
 use App\Apps\CmsproLocalservice\Controllers\Admin\Api\ExtensionApiController;
 use App\Apps\CmsproLocalservice\Controllers\Admin\Api\LogApiController;
+use App\Apps\CmsproLocalservice\Controllers\Admin\Api\McpApiController;
 use App\Apps\CmsproLocalservice\Controllers\Admin\Api\ScriptApiController;
 use App\Apps\CmsproLocalservice\Controllers\Admin\Api\ServiceApiController;
 use App\Apps\CmsproLocalservice\Controllers\Admin\Api\SettingApiController;
@@ -10,6 +11,7 @@ use Illuminate\Support\Facades\Route;
 
 // 服务控制
 Route::get('/service/status', [ServiceApiController::class, 'status']);
+Route::get('/service/commands', [ServiceApiController::class, 'commands']);
 Route::get('/service/installed-apps', [ServiceApiController::class, 'installedApps']);
 Route::post('/service/install-script', [ServiceApiController::class, 'installScript']);
 Route::post('/service/uninstall-script', [ServiceApiController::class, 'uninstallScript']);
@@ -59,4 +61,25 @@ Route::prefix('scripts')->controller(ScriptApiController::class)->group(function
     Route::delete('{id}', 'destroy');
     Route::post('{id}/exec', 'execute');
     Route::post('init-defaults', 'initDefaults');
+});
+
+// MCP 服务（工具接入与安全授权）
+Route::prefix('mcp')->controller(McpApiController::class)->group(function () {
+    // 工具与配置
+    Route::get('tools', 'tools');
+    Route::get('config', 'config');
+    Route::post('config', 'saveConfig');
+    Route::post('config/regenerate-prefix', 'regeneratePathPrefix');
+    Route::get('prompt', 'prompt');
+    Route::post('sync', 'sync');
+
+    // 访问凭据
+    Route::get('keys', 'keys');
+    Route::get('keys/{id}', 'keyShow');
+    Route::post('keys', 'keyStore');
+    Route::put('keys/{id}', 'keyUpdate');
+    Route::delete('keys/{id}', 'keyDestroy');
+    Route::post('keys/{id}/toggle', 'keyToggle');
+    Route::post('keys/{id}/low-risk-only', 'keyLowRiskOnly');
+    Route::post('keys/{id}/restore-default', 'keyRestoreDefault');
 });

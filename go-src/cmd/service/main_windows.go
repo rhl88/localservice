@@ -12,6 +12,7 @@ import (
 	"cmspro-local-service/internal/api"
 	"cmspro-local-service/internal/config"
 	"cmspro-local-service/internal/extension"
+	"cmspro-local-service/internal/mcp"
 	"cmspro-local-service/internal/storage"
 	"cmspro-local-service/internal/task"
 	"cmspro-local-service/internal/winservice"
@@ -161,9 +162,48 @@ func runForeground() {
 
 	// 初始化处理器并启动 HTTP 服务器
 	handlers := api.NewHandlers(db, taskMgr, extMgr)
+
+	// 装配 MCP 服务（配置由 PHP 后台写入本配置文件后下发）
+	mcpServer := mcp.NewServerFrom(buildMcpConfig(cfg), Version, mcp.NewStorageAuditSink(func(level, message string) error {
+		appID := "cmspro.localservice"
+		return db.InsertLog(appID, nil, level, message, nil)
+	}), nil)
+	handlers.SetMcp(mcpServer)
+
 	server := api.NewServer(handlers)
 	if err := server.Start(); err != nil {
 		log.Fatalf("HTTP 服务器启动失败: %v", err)
+	}
+}
+
+// buildMcpConfig 把配置文件的 MCP 段映射为 MCP 引导配置（未配置时返回禁用态）
+func buildMcpConfig(cfg *config.Config) *mcp.BootstrapConfig {
+	if cfg == nil || cfg.MCP == nil {
+		return &mcp.BootstrapConfig{Enabled: false}
+	}
+	src := cfg.MCP
+	creds := make([]*mcp.Credential, 0, len(src.Credentials))
+	for _, c := range src.Credentials {
+		creds = append(creds, &mcp.Credential{
+			ID:          c.ID,
+			Token:       c.Token,
+			Name:        c.Name,
+			ToolIDs:     c.ToolIDs,
+			Disabled:    c.Disabled,
+			CreatedAt:   c.CreatedAt,
+			ExpiresDays: c.ExpiresDays,
+			Active:      c.Active,
+		})
+	}
+	return &mcp.BootstrapConfig{
+		Enabled:         src.Enabled,
+		PathPrefix:      src.PathPrefix,
+		IPAllowlist:     src.IPAllowlist,
+		RateLimitMax:    src.RateLimitMax,
+		RateLimitWindow: src.RateLimitWindow,
+		DefaultTimeout:  src.DefaultTimeout,
+		MaxConcurrent:   src.MaxConcurrent,
+		Credentials:     creds,
 	}
 }
 

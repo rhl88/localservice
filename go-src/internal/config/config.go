@@ -19,6 +19,33 @@ type Config struct {
 	OpenAPIKey       string `json:"open_api_key"`
 	Timezone         string `json:"timezone"`
 	CmsproBaseURL    string `json:"cmspro_base_url"`
+	// MCP MCP 服务配置（由 PHP 后台维护并随本文件下发，Go 侧只读使用）
+	MCP *MCPConfig `json:"mcp,omitempty"`
+}
+
+// MCPConfig MCP 服务配置（结构对应 internal/mcp.Config，此处独立定义以避免
+// config 包反向依赖 mcp 包）
+type MCPConfig struct {
+	Enabled         bool            `json:"enabled"`
+	PathPrefix      string          `json:"path_prefix"`
+	IPAllowlist     []string        `json:"ip_allowlist"`
+	RateLimitMax    int             `json:"rate_limit_max"`
+	RateLimitWindow int             `json:"rate_limit_window"`
+	Credentials     []MCPCredential `json:"credentials"`
+	DefaultTimeout  int             `json:"default_timeout"`
+	MaxConcurrent   int             `json:"max_concurrent"`
+}
+
+// MCPCredential MCP 访问凭据（Token 由 PHP 生成）
+type MCPCredential struct {
+	ID          string   `json:"id"`
+	Token       string   `json:"token"`
+	Name        string   `json:"name"`
+	ToolIDs     []string `json:"tool_ids"`
+	Disabled    []string `json:"disabled"`
+	CreatedAt   string   `json:"created_at"`
+	ExpiresDays int      `json:"expires_days"`
+	Active      bool     `json:"active"`
 }
 
 var (

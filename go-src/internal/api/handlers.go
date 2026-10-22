@@ -8,6 +8,7 @@ import (
 
 	"cmspro-local-service/internal/buildinfo"
 	"cmspro-local-service/internal/extension"
+	"cmspro-local-service/internal/mcp"
 	"cmspro-local-service/internal/storage"
 	"cmspro-local-service/internal/task"
 )
@@ -17,11 +18,48 @@ type Handlers struct {
 	db     *storage.DB
 	tasks  *task.Manager
 	extMgr *extension.Manager
+	mcp    *mcp.Server
 }
 
 // NewHandlers 创建 Handlers 实例
 func NewHandlers(db *storage.DB, taskMgr *task.Manager, extMgr *extension.Manager) *Handlers {
 	return &Handlers{db: db, tasks: taskMgr, extMgr: extMgr}
+}
+
+// SetMcp 注入 MCP 服务（启动时装配，供路由与配置查询端点使用）
+func (h *Handlers) SetMcp(s *mcp.Server) {
+	h.mcp = s
+}
+
+// McpTools MCP 工具清单查询（后台界面用）
+// 返回全部工具的元数据与各风险等级统计
+func (h *Handlers) McpTools(w http.ResponseWriter, r *http.Request) {
+	reg := mcp.DefaultRegistry()
+	writeSuccess(w, map[string]interface{}{
+		"tools":       reg.MetaList(),
+		"total":       reg.Count(),
+		"risk_counts": reg.RiskCounts(),
+	})
+}
+
+// McpConfig MCP 服务运行配置查询（后台界面用，凭据 Token 已脱敏）
+func (h *Handlers) McpConfig(w http.ResponseWriter, r *http.Request) {
+	if h.mcp == nil {
+		writeError(w, 503, "MCP 服务未装配")
+		return
+	}
+	cfg := h.mcp.Config()
+	writeSuccess(w, map[string]interface{}{
+		"enabled":           cfg.Enabled,
+		"path_prefix":       cfg.PathPrefix,
+		"mcp_path":          h.mcp.MCPPath(),
+		"ip_allowlist":      cfg.IPAllowlist,
+		"rate_limit_max":    cfg.RateLimitMax,
+		"rate_limit_window": cfg.RateLimitWindow,
+		"default_timeout":   cfg.DefaultTimeout,
+		"max_concurrent":    cfg.MaxConcurrent,
+		"credential_count":  len(cfg.Credentials),
+	})
 }
 
 // Status 服务状态查询

@@ -3,6 +3,7 @@
 namespace App\Apps\CmsproLocalservice;
 
 use App\Apps\CmsproLocalservice\Services\LocalServiceClient;
+use App\Apps\CmsproLocalservice\Services\McpService;
 use App\Apps\CmsproLocalservice\Services\ScriptService;
 use App\Apps\CmsproLocalservice\Services\ServiceManager;
 use Illuminate\Support\Facades\Route;
@@ -28,6 +29,10 @@ class ServiceProvider extends BaseServiceProvider
 
         $this->app->singleton(ScriptService::class, function ($app) {
             return new ScriptService($app->make(LocalServiceClient::class));
+        });
+
+        $this->app->singleton(McpService::class, function () {
+            return new McpService();
         });
     }
 

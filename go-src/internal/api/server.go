@@ -9,12 +9,14 @@ import (
 
 	"cmspro-local-service/internal/config"
 	"cmspro-local-service/internal/llmrelay"
+	"cmspro-local-service/internal/mcp"
 )
 
 // Server HTTP 服务器封装
 type Server struct {
 	httpServer *http.Server
 	handler    *Handlers
+	mcp        *mcp.Server
 }
 
 // NewServer 创建 HTTP 服务器并注册路由
@@ -31,6 +33,9 @@ func NewServer(handlers *Handlers) *Server {
 	mux.HandleFunc("/api/extensions", handlers.ListExtensions)
 	mux.HandleFunc("/api/task/", handlers.TaskDetail)
 	mux.HandleFunc("/api/extensions/", handlers.ExtensionDetail)
+	// MCP 工具清单与配置查询（后台界面用，内部认证）
+	mux.HandleFunc("/api/mcp/tools", handlers.McpTools)
+	mux.HandleFunc("/api/mcp/config", handlers.McpConfig)
 
 	// 开放 API 路由（X-API-Key 认证）
 	// 供第三方跨服务器调用，仅暴露任务执行能力
@@ -41,12 +46,26 @@ func NewServer(handlers *Handlers) *Server {
 	openMux.HandleFunc("/api/open/status", handlers.Status)
 	openAPIHandler := OpenAPIAuthMiddleware(openMux)
 
+	// MCP 服务：工具注册表 + 协议服务（配置由本地服务配置文件下发）
+	registry := mcp.DefaultRegistry()
+	if handlers.mcp == nil {
+		if err := mcp.RegisterBuiltinTools(registry); err != nil {
+			log.Printf("[mcp] 内置工具注册失败: %v", err)
+		}
+	}
+	mcpServer := handlers.mcp
+
 	// 合并路由：开放 API 路径走独立中间件，其余走内部认证
 	// AI 透传路由（/open/llm/）不做应用级鉴权：鉴权委托各应用决策接口，
 	// 客户端 Authorization 原样透传；服务仅监听 127.0.0.1
+	// MCP 路由（{prefix}/mcp）自带鉴权/白名单/限流/审计，不走内部认证
 	combinedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/open/llm/") {
 			llmrelay.Handler(w, r)
+			return
+		}
+		if mcpServer != nil && mcpServer.Enabled() && r.URL.Path == mcpServer.MCPPath() {
+			mcpServer.ServeHTTP(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/open/") {
@@ -65,6 +84,7 @@ func NewServer(handlers *Handlers) *Server {
 			Handler: combinedHandler,
 		},
 		handler: handlers,
+		mcp:     mcpServer,
 	}
 }
 

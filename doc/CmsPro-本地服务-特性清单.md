@@ -19,6 +19,7 @@
 | 三终端 | 后台（admin） | `ServiceProvider::registerRoutes()` |
 | Go 服务 | 独立常驻 Go 服务（Windows 服务/Linux daemon）承担实际执行 | `Bin/`、`go-src/` |
 | AI 透传扩展 | 通用 LLM 流式透传处理器：Go 承接 SSE 双向转发（goroutine 不占 php-cgi worker），PHP 保留决策/日志/账号维护；通用路由 `/open/llm/{app}/{prefix}/*path`，任意应用按契约接入；决策契约支持 `local_response` 本地短路、`body_override` 请求体改写（决策请求随 `body` 上送原始请求体，改写权在应用侧）；连接层失败（连接失败/超时/流中断）在未输出实质数据前自动换号重试，换号前逐次同步回调即时归因（429 冷却/401 禁用/出口计数），429 重试前喘息 1s、错误消息语义化注解，心跳不掩蔽空闲超时 | `go-src/internal/llmrelay/`、`doc/CmsPro-本地服务-AI透传扩展指南.md` |
+| MCP 服务 | 把本机能力（系统/文件/进程/服务/浏览器共 32 个工具）通过 MCP 协议（2025-03-26，Streamable HTTP）开放给外部 AI 工具：工具按低/中/高三级风险分级（12/11/9），低风险默认授权、中高风险 opt-in；「凭据 × 工具」权限矩阵，每凭据独立授权且互不影响；IP 白名单（`*`/单IP/CIDR/区间）+ 滑动窗口限流（默认 300次/60秒）+ 随机路由前缀（`/mcp-{12位}`）+ 调用审计；高风险工具调用需二次确认（确认键含凭据+工具+完整参数哈希，TTL 600s，一次性消费防重放/双执行）。Go 侧同进程实现并复用既有任务处理器（与 `/api/task` 同链路） | `go-src/internal/mcp/`、`Services/McpService.php`、`Models/McpKey.php`、`Views/Admin/mcp/`、`doc/CmsPro-本地服务-MCP服务指南.md` |
 
 ---
 
@@ -26,8 +27,8 @@
 
 | 终端 | 路由前缀 | 中间件 | 说明 |
 |------|----------|--------|------|
-| 后台管理 | `/admin/cmspro/localservice` | `web`, `auth:admin` | 仪表盘、任务、日志、拓展、指令、配置 |
-| 后台 API | `/api/admin/cmspro/localservice` | `web`, `auth:admin` | 后台管理接口 |
+| 后台管理 | `/admin/cmspro/localservice` | `web`, `auth:admin` | 仪表盘、任务、日志、拓展、指令、配置、MCP 服务 |
+| 后台 API | `/api/admin/cmspro/localservice` | `web`, `auth:admin` | 后台管理接口（含 `/mcp/*` MCP 管理端点） |
 
 **实现位置**：`ServiceProvider::registerRoutes()`
 
@@ -51,12 +52,14 @@
 | 表名 | 说明 |
 |------|------|
 | `app_cmspro_localservice_custom_scripts` | 指令库表（CustomScript） |
+| `app_cmspro_localservice_mcp_keys` | MCP 访问凭据表（McpKey，含授权集 tool_ids 与禁用集 disabled） |
 
-**模型**：`Models/CustomScript.php`
+**模型**：`Models/CustomScript.php`、`Models/McpKey.php`
 
 **实现位置**：`Migrations/`、`Models/`
 
 > Go 端使用 SQLite（`storage/local_service.db`）存储任务、日志、拓展数据，由 Go 服务自动创建与初始化。
+> MCP 凭据与访问控制配置真源在 PHP（数据库），经 `local_service_config.json` 的 `mcp` 段下发给 Go 服务；Go 侧只读使用，不本地持久化。
 
 ---
 
@@ -76,8 +79,13 @@
 | `auth_token` | password | 自动生成 | 认证 Token（内部 API 使用） |
 | `log_level` | select | info | 日志级别（debug/info/warn/error） |
 | `log_retention_days` | number | 30 | 日志保留天数 |
+| `mcp_enabled` | switch | 0 | MCP 服务开关（1=启用） |
+| `mcp_path_prefix` | text | 首次读取自动生成 | MCP 随机路由前缀（`/mcp-{12位}`） |
+| `mcp_ip_allowlist` | text | * | MCP IP 白名单（逗号分隔，支持 `*`/IP/CIDR/区间） |
+| `mcp_rate_limit_max` | number | 300 | MCP 限流上限（每窗口请求数） |
+| `mcp_rate_limit_window` | number | 60 | MCP 限流窗口（秒） |
 
-**实现位置**：`manifest.json`、`Config/localservice.php`、`Controllers/Admin/SettingController.php`
+**实现位置**：`manifest.json`、`Config/localservice.php`、`Controllers/Admin/SettingController.php`、`Services/McpService.php`（MCP 配置项）
 
 ---
 
