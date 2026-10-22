@@ -506,6 +506,10 @@ class McpApiTest extends LocalserviceTestCase
         $this->assertStringContainsString('cmspro-local', $prompt);
         $this->assertStringContainsString('Authorization', $prompt);
         $this->assertStringContainsString('/mcp', $prompt);
+
+        // 端点必须为本机地址（本地服务仅监听 127.0.0.1），不得使用站点域名
+        $this->assertMatchesRegularExpression('#http://127\.0\.0\.1:\d+/mcp-#', $prompt);
+        $this->assertStringNotContainsString((string) config('app.url', ''), $prompt);
     }
 
     public function test_config_requires_authentication(): void

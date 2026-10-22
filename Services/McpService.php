@@ -570,14 +570,17 @@ class McpService
 
     /**
      * 生成给 AI Agent 的接入提示词（对齐宝塔「复制提示词」体验）
+     *
+     * 端点固定为本机地址（127.0.0.1:端口）——本地服务仅监听 127.0.0.1，
+     * 站点域名不经代理无法到达该端口；域名端点也会被多数 MCP 客户端的
+     * 「非本机地址必须 https」安全策略拒绝。
      */
     public function buildPrompt(): string
     {
         $config = $this->config();
         $key = McpKey::where('active', 1)->orderByDesc('id')->first();
 
-        $url = rtrim((string) config('app.url', 'http://127.0.0.1'), '/');
-        $endpoint = $url.':'.(string) $this->configItem('port', 9501).$config['mcp_path'];
+        $endpoint = app(ServiceManager::class)->relayBaseUrl().$config['mcp_path'];
         $token = $key !== null ? (string) $key->token : '<请先在后台创建访问凭据>';
 
         return <<<PROMPT
@@ -596,7 +599,7 @@ class McpService
 }
 
 说明：
-1. 该 MCP 服务提供本机（运行本地服务的机器）的系统、文件、进程、服务与浏览器操作能力。
+1. 该 MCP 服务提供本机（运行本地服务的机器）的系统、文件、进程、服务与浏览器操作能力，要求 AI 工具与本地服务部署在同一台机器上（端点为 127.0.0.1 本机地址）。
 2. 高风险工具（执行命令、写删文件、终止进程等）首次调用会返回 waiting_confirm，需要用户明确确认后才会执行。
 3. 接入后请先用只读工具（如 SystemInfo）验证连通性，确认正常后再执行其他操作。
 PROMPT;
