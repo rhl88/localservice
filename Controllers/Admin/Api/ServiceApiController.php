@@ -44,6 +44,42 @@ class ServiceApiController
     }
 
     /**
+     * 桌面小工具数据：本地服务运行状态。
+     *
+     * WebOS 桌面小工具按 manifest.widgets[].refresh 秒轮询本接口，返回统一契约
+     * {title,status,value,unit,items,updated_at}；status 取 running|stopped|warning。
+     */
+    public function widgetStatus()
+    {
+        $status = $this->manager->status();
+        $online = (bool) ($status['online'] ?? false);
+
+        $total = 0;
+        $success = 0;
+        if ($online) {
+            $res = $this->client->listTasks(['page' => 1, 'page_size' => 1]);
+            $total = (int) ($res['data']['total'] ?? 0);
+
+            $okRes = $this->client->listTasks(['status' => 'success', 'page' => 1, 'page_size' => 1]);
+            $success = (int) ($okRes['data']['total'] ?? 0);
+        }
+
+        return ApiResponse::success([
+            'title' => '本地服务状态',
+            // 在线=running；离线但二进制存在=stopped（可手动启动）；二进制缺失=warning（需重新安装）
+            'status' => $online ? 'running' : (($status['binary_exists'] ?? false) ? 'stopped' : 'warning'),
+            'value' => $status['version'] ?? null,
+            'unit' => '',
+            'items' => [
+                ['label' => '端口', 'value' => (string) parse_url($this->manager->relayBaseUrl(), PHP_URL_PORT)],
+                ['label' => '累计任务', 'value' => (string) $total],
+                ['label' => '成功率', 'value' => $total > 0 ? round($success / $total * 100, 1) . '%' : '—'],
+            ],
+            'updated_at' => now()->format('Y-m-d H:i:s'),
+        ]);
+    }
+
+    /**
      * 生成安装脚本。
      */
     public function installScript()

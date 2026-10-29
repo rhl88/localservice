@@ -19,6 +19,9 @@ Route::post('/service/start', [ServiceApiController::class, 'start']);
 Route::post('/service/stop', [ServiceApiController::class, 'stop']);
 Route::post('/service/restart', [ServiceApiController::class, 'restart']);
 
+// 桌面小工具数据（WebOS 桌面小工具按 manifest.widgets[].refresh 秒轮询）
+Route::get('/widget/status', [ServiceApiController::class, 'widgetStatus']);
+
 // 服务更新（版本服务器：v5.cmspro.cn；分段状态机模式，避免长请求被网关超时中断）
 Route::get('/service/update/check', [ServiceApiController::class, 'updateCheck']);
 Route::post('/service/update/start', [ServiceApiController::class, 'updateStart']);
