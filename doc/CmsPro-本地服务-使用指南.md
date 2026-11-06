@@ -1,7 +1,7 @@
 # CmsPro-本地服务-使用指南
 
-> 版本：1.2.1 | 更新日期：2026-09-25
-> 应用版本：1.2.1 | 应用 ID：cmspro.localservice
+> 版本：1.2.8 | 更新日期：2026-10-14
+> 应用版本：1.2.8 | 应用 ID：cmspro.localservice
 
 ---
 
@@ -64,6 +64,8 @@ php artisan app:install cmspro.localservice
 
 **Linux 平台**：以 root 身份运行生成的 `.sh` 脚本，完成 systemd 服务注册并启动。
 
+> **版本来源**：生成安装脚本时自动从版本服务器（`https://v5.cmspro.cn`，由 Versionsvr 应用「本地服务版本管理」提供）获取最新**已发布**版本——本地无二进制或版本落后时自动下载（带大小 + SHA256 校验），已是最新则跳过；版本服务器不可达时降级使用本地已有二进制，不阻塞脚本生成。下载地址与校验值由版本服务器 latest 接口下发，不再使用旧的硬编码静态地址。
+
 > **宝塔加固兼容**：若服务器启用了宝塔「系统加固」等策略，对 `/etc/systemd/system` 设置了 immutable（`chattr +i`），则即便是 root 写入 unit 文件也会报 `Operation not permitted`。安装/卸载脚本会自动检测该加固并临时解除，操作完成后恢复原状，无需手工干预；`chattr`/`lsattr` 不可用时静默跳过。
 
 ### 3.2 后台功能验证
@@ -77,11 +79,15 @@ php artisan app:install cmspro.localservice
 | 日志查看 | `/admin/cmspro/localservice/logs` | 日志列表（按 level 过滤） |
 | 拓展管理 | `/admin/cmspro/localservice/extensions` | 拓展列表、配置、测试 |
 | 指令管理 | `/admin/cmspro/localservice/scripts` | 指令库 CRUD、执行 |
-| 基本配置 | `/admin/cmspro/localservice/settings` | 端口、Token、日志级别、开放 API |
+| 基本配置 | `/admin/cmspro/localservice/settings` | Tab 布局：基本配置（端口、Token、日志级别、日志保留天数、时区）、开放 API、服务命令 |
+
+> **设置页 Tab 结构**：「基本配置」Tab 含保存设置与生成安装/卸载脚本入口；「开放 API」Tab 含启用开关与密钥管理；「服务命令」Tab 展示当前环境检测信息（运行平台、服务名、PHP 运行用户、exec/shell_exec 是否可用、脚本目录）与平台对应的手动管理命令（Windows 为 `sc` 命令，Linux 为 `systemctl` 命令及 PHP 用户 sudo 免密授权一次性配置），每条命令带一键复制按钮——适用于 PHP 禁用 `exec/shell_exec`（宝塔等面板常见）或运行用户权限不足、后台启停按钮无法直接执行的场景，命令内容与后端 `runServiceCommand()` 降级提示保持一致。
 
 ### 3.3 服务状态验证
 
 在「仪表盘」页面查看服务状态，确认 Go 服务在线（HTTP 可达且 code=0）。「服务状态」卡片中的版本号为 Go 服务上报的真实版本号（编译时经 ldflags 注入 `buildinfo.Version`）。
+
+> **未安装引导**：服务未安装（本地无二进制且不在线）时，仪表盘状态显示「未安装」，启停按钮禁用，并在卡片内提示前往「基本配置」页面生成安装脚本、按提示以管理员/root 权限运行完成安装；服务上线后提示自动消失并补拉任务数据。最近任务数据存于 Go 服务端，服务离线/未安装时渲染空表格，不再弹「获取任务失败」错误。
 
 ### 3.4 服务在线更新
 
@@ -99,7 +105,11 @@ php artisan app:install cmspro.localservice
 
 > 平台自动识别：Windows amd64 / Linux amd64 / Linux arm64（按 `php_uname('m')` 判定）。更新耗时与二进制下载速度相关，每个分段请求最长约 15-20 秒，中途关闭弹窗/刷新页面不影响后台任务推进（重新打开页面会恢复轮询）。
 
-**PHP disable_functions 环境自动降级**：当 PHP 环境禁用 `exec/shell_exec`（宝塔等面板常见）或权限不足时，停服/启服命令自动降级**经本地 Go 服务执行**（Go 以系统服务身份运行，不受 PHP 函数禁用限制且权限更高）。因停止命令执行后 Go 进程随之退出，降级停止前会先布置「延迟启动」分离进程（`storage/app/localservice/delayed-start.bat|.sh`，10 秒后自动拉起服务），为文件替换留出时间窗口，启动验证轮询（约 20 秒）恰好覆盖——整个更新流程无需人工干预。仪表盘手动「停止」不布置延迟启动，服务保持停止状态。
+**PHP disable_functions 环境自动降级**：当 PHP 环境禁用 `exec/shell_exec`（宝塔等面板常见）或权限不足时，停服/启服命令自动降级**经本地 Go 服务执行**（Go 以系统服务身份运行，不受 PHP 函数禁用限制且权限更高）。因停止命令执行后 Go 进程随之退出，降级停止前会先布置「延迟启动」分离进程——Windows 用延迟启动脚本（`delayed-start.bat`，10 秒后 `sc start`），Linux 用 `systemd-run` 一次性 transient timer（`--on-active=10 --timer-property=AccuracySec=1s`，10 秒后 `systemctl start`），为文件替换留出时间窗口，启动验证轮询（约 20 秒）恰好覆盖——整个更新流程无需人工干预。仪表盘手动「停止」不布置延迟启动，服务保持停止状态。
+
+> Linux 注意一：降级停止执行的是 `systemctl stop` 停止 Go 服务自身，Go 进程被 systemd SIGTERM 终止时 HTTP 响应必然中断（客户端报 `cURL error 52: Empty reply from server`），与「经 Go 重启」同属预期现象。PHP 端以「服务已下线」轮询（短超时探测，窗口小于延迟启动的 10 秒等待期）判定停止成功，不会误报「停止服务失败」而中止更新；停止命令响应正常时以 systemctl 退出码判定（如 unit 不存在的报错会提前失败并给出原始输出）。
+
+> Linux 注意二：延迟启动必须经 `systemd-run` 一次性 timer 布置，不能用 `nohup` 后台脚本——后者是 Go 服务的子进程、归属服务 cgroup，`systemctl stop` 默认 `KillMode=control-group` 会将其连带 SIGTERM 清理，导致延迟启动静默失效、新版本永不拉起、verify 5 轮后误回滚（v1.2.6 及之前版本的实际缺陷）；`systemd-run` 的 timer 由 PID 1 管理，不在服务 cgroup 内，不受停止清理影响。timer 触发精度须用 `--timer-property=AccuracySec=1s` 指定（systemd-run 无 `--accuracy` 选项，误用会导致布置命令退出码 125 而中止更新）。
 
 ### 3.5 命令行管理
 
@@ -201,3 +211,10 @@ CmsproLocalservice/
 | 1.1.6 | 2026-09-20 | 修复 Go 透传通道高频报「上游连接失败: http2: timeout awaiting response headers」的问题：等响应头预算此前误用 first_byte_timeout（10s/30s），大上下文 prefill 超过即失败；现决策契约新增 `header_timeout_ms`（对齐 PHP 通道 header_timeout=60s），first_byte_timeout 回归「响应头后首数据空读上限」语义。需各接入应用同步升级后生效 |
 | 1.2.0 | 2026-09-24 | 服务在线更新：Go 服务真实版本号经 ldflags 注入（`buildinfo.Version`），仪表盘「服务状态」显示真实版本；新增 UpdateService 对接版本服务器（v5.cmspro.cn）实现检查更新与应用更新（下载校验→停服→备份替换→重启→失败回滚），有新版本时仪表盘显示「更新」按钮一键升级。配套 Versionsvr 应用 v1.1.0 的「本地服务」版本发布功能使用 |
 | 1.2.1 | 2026-09-25 | 更新执行模式重构为分段状态机（修复一键更新 502）：原 apply 接口在单 HTTP 请求内同步完成下载→停服→替换→重启，大文件下载时被 Nginx/PHP-FPM 超时中断（502 Bad Gateway）；现拆分为 `update/start`（创建任务返回 run_id）+ `update/step`（前端 600ms 轮询单步推进）+ `update/status`（页面刷新恢复轮询）三接口，下载支持 15 秒时间片 + Range 断点续传，新增进行中任务防双跑（50014）与任务失效（50015）错误码 |
+| 1.2.2 | 2026-10-10 | 安装脚本版本来源切换与未安装引导：生成安装脚本时二进制自动同步为版本服务器（Versionsvr）最新已发布版本（latest 接口下发下载地址 + 大小/SHA256 校验，替代旧硬编码静态地址；本地落后或无版本标记时自动重下，服务器不可达时降级用本地文件），版本经 `Bin/local-service.version` 标记比对；Linux arm64 机器安装脚本改用 `currentBinaryPath()` 修正此前引用不存在 amd64 路径的问题；仪表盘新增「未安装」状态——无二进制且不在线时提示前往设置页生成安装脚本，启停按钮禁用，离线期间最近任务渲染空表格不再弹错 |
+| 1.2.3 | 2026-10-10 | 设置页 Tab 化与服务命令面板：设置页重构为 layui Tab 布局（基本配置 / 开放 API / 服务命令）；新增 `GET /api/admin/cmspro/localservice/service/commands` 接口（`ServiceManager::serviceCommands()`），返回运行平台、服务名、PHP 运行用户、exec/shell_exec 可用性、脚本目录及平台对应手动管理命令清单（Windows `sc` / Linux `systemctl` + PHP 用户 sudo 免密授权一次性配置），前端按分组渲染并支持一键复制——解决宝塔等面板禁用 `exec/shell_exec` 或运行用户权限不足时后台启停按钮失效、用户无从获取命令的问题，命令内容与 `runServiceCommand()` 降级提示保持一致 |
+| 1.2.4 | 2026-10-10 | 修复启停按钮"静默成功"误报为"exec/shell_exec 均不可用"：`safeShellExec()` 此前以"有输出"作为命令可执行依据，而 Linux `sudo systemctl start/stop/restart` 成功时静默无输出——配置 sudo 免密授权后命令实际执行成功，却因空输出被误判为函数不可用（503），且重启实际已生效；现 `safeShellExec()` 改为返回 `output + exit_code` 结构（优先 exec 获取可靠退出码，shell_exec 兜底时以 -1 标记），`runServiceCommand()` 以退出码判定成败（退出码未知时按输出特征兜底），空输出 + 退出码非失败 = 成功；Windows restart 分支同步适配，503 降级提示统一引导至设置页「服务命令」Tab |
+| 1.2.5 | 2026-10-10 | Linux 重启补齐经 Go 服务的降级路径：`exec/shell_exec` 被面板禁用（disable_functions）时 sudoers 授权无法绕过函数禁用，此前 stop 有「经本地 Go 服务执行」降级而 restart 没有——PHP 直接执行必然 503；现 `restart()` 在 403/503 时走新增的 `restartViaGo()`：经 Go 执行 `systemctl restart`（Go 自身随服务重启退出、响应中断属预期），随后以 2 秒短超时轮询 status（最多 8 次，unit `RestartSec=5` 约 6-10 秒内恢复）确认服务重新上线；`LocalServiceClient::isOnline()` 新增可选超时参数支持短超时探测。注：启动（start）场景服务停止后 Go 必然离线，无法经 Go 降级，仅能引导至「服务命令」Tab 手动执行 |
+| 1.2.6 | 2026-10-14 | 修复 Linux 在线更新报「停止服务失败：经本地服务执行停止命令失败：本地服务不可用： cURL error 52」而中止更新的问题：降级停止经 Go 执行 `systemctl stop` 停止 Go 服务自身，进程被 systemd SIGTERM 终止时 HTTP 响应必然中断（cURL error 52），此前被误判为停止失败——实际服务已停止、延迟启动已布置；现响应中断时以「服务已下线」短超时轮询（`waitServiceOffline()`，窗口小于延迟启动 10 秒等待期）判定停止成功，仅在下线确认失败时报错；响应正常时补查 systemctl 退出码（unit 不存在等报错提前失败并给出原始输出），Windows 分支行为不变 |
+| 1.2.7 | 2026-10-14 | 修复 Linux 在线更新报「新版本启动失败，已回滚旧版本」的问题（journal 无任何 start 记录实证延迟启动从未执行）：延迟启动此前用 `nohup bash delayed-start.sh &` 布置，该后台进程是 Go 服务的子进程、归属服务 cgroup，紧随其后的 `systemctl stop` 默认 `KillMode=control-group` 将其连带 SIGTERM 清理——延迟启动静默失效，新版本永不拉起，verify 5 轮后误回滚；现 Linux 改用 `systemd-run` 一次性 transient timer 布置延迟启动（timer 由 PID 1 管理，不在服务 cgroup 内，不受停止清理影响），Windows 仍用 `delayed-start.bat`（`createDelayedStartScript()` 清理为仅 Windows 逻辑），并已在 WSL/deepin25 实测 systemd-run 延迟启动链路可用 |
+| 1.2.8 | 2026-10-14 | 修复 v1.2.7 的 systemd-run 精度参数误用：`--accuracy=1s` 不是 systemd-run 的有效选项（WSL 实测报 `unrecognized option`、退出码 125），导致「布置延迟启动进程失败：success」中止更新；改用 `--timer-property=AccuracySec=1s` 指定触发精度（实测 5 秒 timer 精确触发），同时修复布置失败时错误信息被 message（success）掩盖的问题——命令层面失败现给出「退出码 + 原始输出」，便于快速定位 |

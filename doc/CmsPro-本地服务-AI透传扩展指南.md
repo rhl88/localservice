@@ -1,6 +1,6 @@
 # CmsPro-本地服务-AI透传扩展指南
 
-> 版本：1.0.0 | 更新日期：2026-09-18
+> 版本：1.1.14 | 更新日期：2026-10-20
 > 适用应用版本：cmspro.localservice >= 1.1.0
 
 ## 一、概述
@@ -122,7 +122,10 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 | `proxy_ip` | 出口 IP 展示值（仅日志用） |
 | `retry_policy` | 重试策略（毫秒），字段含义见下表 |
 | `local_response` | **本地短路响应（可选）**。存在时 Go 直接把 `body` 以 `status` 状态码写给客户端（`Content-Type: application/json`），不连上游、不发日志回调。用于 models 等管理类端点由 CmsPro 侧本地出数（如仅返回后台「启用」的模型），决策失败语义不适用（短路即最终响应） |
-| `body_override` | **改写后的请求体（可选）**。存在时 Go 整体替换客户端原始请求体后转发上游。典型用途：模型别名解析（客户端传 `model_name` 别名，须回写为上游真实 `model_id`）。仅在 `body` 已上送且实际发生改写时下发；未下发时 Go 原样转发原始请求体 |
+| `body_override` | **改写后的请求体（可选）**。存在时 Go 整体替换客户端原始请求体后转发上游。典型用途：模型别名解析（客户端传 `model_name` 别名，须回写为上游真实 `model_id`）；协议转换场景（如 Chat Completions → Responses）整体改写为上游协议载荷。仅在 `body` 已上送且实际发生改写时下发；未下发时 Go 原样转发原始请求体 |
+| `response_transform` | **响应转换指令（可选）**。当前唯一取值 `responses_to_chat`：Go 把上游 Responses API SSE 回转为 Chat Completions SSE 后发给客户端。典型场景：上游仅提供 Responses API（如 Codex），决策层经 `body_override` 下发转换后的 Responses 载荷（恒为流式），Go 侧按本指令回转响应方向——流式请求逐事件实时转换（io.Reader 包装，心跳/输出闸门/超时/零输出重试等流控机制全部复用），非流式请求全量转换后聚合为标准 `chat.completion` JSON。未下发时响应原样透传 |
+| `response_transform_model` | **响应转换回写模型名（可选，随 `response_transform` 下发）**。转换后 chunk 的 `model` 字段值（如模型别名解析后的真实 `model_id`），与 PHP 通道响应 `model` 字段保持一致 |
+| `strip_tool_names` | **响应中需剔除的工具调用名列表（可选）**。字符串数组；**缺省或空数组时 Go 完全保持原有行为（既有接入方零感知，向后兼容承诺）**。非空时 Go 在三条响应路径（流式增量、非流式聚合、非流式完整 JSON 透传）按 `function.name` 精确剔除命中名单的 tool_call：用于剔除网关注入的「入场券工具」（如需为通过上游 FreeTier 校验而注入的 `read`）被上游回显时产生的幽灵调用，避免客户端收到未声明工具而误执行。流式按 tool_call `index` 跟踪 `function.name` 分片累积判定；剔除后若无正文/思考内容（等价上游零输出）判 `failed` 且可换号重试 |
 
 **retry_policy 字段**：
 
@@ -175,8 +178,8 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 
 | 字段 | 说明 |
 |------|------|
-| `status` | `success` 流完整结束 / `interrupted` 客户端中断 / `failed` 上游失败（**每次尝试均回调**：换号重试前的中间尝试同步回调即时归因，最终失败为重试穷尽后回调） |
-| `error_kind` | 错误归类：`auth`(401/403)、`rate_limit`(429)、`upstream`(5xx/读取失败)、`connect`(连接失败)、`timeout`(空闲超时)、`client`(客户端中断)、空=成功 |
+| `status` | `success` 流完整结束（`data: [DONE]` 已写出客户端，或上游正常关闭流）/ `interrupted` 客户端在流完整结束前断开 / `failed` 上游失败（**每次尝试均回调**：换号重试前的中间尝试同步回调即时归因，最终失败为重试穷尽后回调） |
+| `error_kind` | 错误归类：`auth`(401/403)、`rate_limit`(429)、`quota`(402 额度不足)、`upstream`(5xx/读取失败)、`connect`(连接失败)、`timeout`(空闲超时)、`client`(客户端中断)、空=成功 |
 | `usage` 三字段 | 来自上游 `stream_options.include_usage` 报告值；上游未返回时为 0 |
 
 响应 HTTP 200 即视为回调成功（响应体不解析）。应用侧应基于 `status`/`error_kind` 做账号与出口维护（参考 3.3）。
@@ -213,17 +216,20 @@ Go 在收到客户端请求后、连接上游前调用。请求头携带：
 |------|------|
 | 本地短路 | 决策响应含 `local_response`（`{status, body}`）时直接写回客户端，不连上游、不回调日志——管理类端点（models 等）由 CmsPro 侧本地出数的通用机制 |
 | 请求体改写 | 决策响应含 `body_override` 时整体替换原始请求体转发上游（如模型别名解析为真实 model_id）；换号重试时决策请求始终携带客户端**原始**请求体，改写不污染后续决策。决策请求的 `body` 以原始字节（RawMessage）上送，应用侧改写时应**对象模式解码**（PHP `json_decode($raw)` stdClass）保真嵌套空对象——关联数组解码会把 `tools[].function.parameters:{}` 等空对象变形为 `[]`，严格上游（JSON Schema 校验）直接 400 |
-| 重试边界 | 未向客户端写出**实质数据**（SSE 注释行 ping/notice 不算，客户端无感）前，连接层失败（连接拒绝、构造请求失败、等响应头超时、首数据超时、空闲超时、流读取失败）与上游 429/401/403/5xx 状态码均按 `retry_policy.max_retries` 重新回调决策接口换号重试；一旦开始写实质数据则不再重试，优雅收尾并回调 `failed` |
+| 响应转换 | 决策响应含 `response_transform=responses_to_chat` 时，上游 Responses SSE 回转为 Chat Completions SSE：流式经 io.Reader 包装逐事件实时转换（事件映射、chunk 结构、usage 归一化、首包兜底、EOF 补齐、`[DONE]` 追加，行为规格移植自 PHP 通道 ProtocolConverter），心跳/输出闸门/超时/零输出重试等流控机制全部复用；非流式全量转换后聚合为标准 `chat.completion` JSON。转换后 chunk 的 `model` 回写 `response_transform_model`。典型场景：Codex 上游仅提供 Responses API，决策层经 `body_override` 完成 Chat→Responses 请求转换，Chat Completions 客户端同享 Go 通道稳定性 |
+| 入口 BOM 剥离 | 客户端请求体带 UTF-8 BOM（Windows 工具链生成的请求体偶发）时入口剥离后再进决策与转发。不剥离会导致决策请求构造时 `json.Marshal` 对含 BOM 的 RawMessage 校验失败，决策请求静默变为空 body，决策端报出误导性的「messages 参数不能为空」。客户端请求体不是合法 JSON（如 UTF-16 编码）时向客户端显式报「客户端请求体不是合法 JSON」，不再静默发送空决策请求体 |
+| 重试边界 | 未向客户端写出**实质数据**（SSE 注释行 ping/notice 不算，客户端无感）前，连接层失败（连接拒绝、构造请求失败、等响应头超时、首数据超时、空闲超时、流读取失败）与上游 429/401/403/402/5xx 状态码均按 `retry_policy.max_retries` 重新回调决策接口换号重试（402 额度不足与 429/401/403 同属单 Key 语义，多 Key 场景可平滑切换）；一旦开始写实质数据则不再重试，优雅收尾并回调 `failed` |
 | 中间尝试回调 | 换号重试前对**每次失败尝试同步回调** `log-callback`（对应各自的 dispatch_id 租约），应用侧即时归因（429 冷却 / 401 禁用 / 402 池级冷却 / 出口失败计数）——对齐 PHP 通道「每轮失败立即 markFailure」，后续请求不再撞刚失败的账号/出口；一次客户端请求最多产生 N+1 条调用日志（每次尝试一条），粒度为「每次上游调用」 |
 | 429 重试节流 | 上游 429 换号重试前固定喘息 1s（对齐 PHP 通道）：限流多为分钟级窗口配额（TPM/RPM），立即重试必然再撞同一窗口；喘息期间客户端中断则提前收尾（该次失败已回调） |
 | 429 消息注解 | 上游 429 错误消息按错误码语义化注解（TPM/RPM 归类 + Key 冷却恢复预期 + 扩充 Key 池/分流建议，对齐 PHP 通道 annotateRateLimitMessage），客户端错误 chunk 与日志回调一致；未识别的 429 变体原样透传 |
 | 心跳保活 | 首字节前按 `first_byte_heartbeat_ms`、活跃期按 `heartbeat_interval_ms` 向客户端发送 SSE 注释行（`: ping`），防止客户端/网关空闲断连；心跳不重置空闲超时计时（半开连接判定只看上游数据到达），避免上游挂死时心跳掩蔽超时 |
 | usage 提取 | 自定义跨块行扫描器解析 SSE 数据行中的 `usage` 字段，兼容上游分块切割 JSON 行的情况 |
-| 零输出判定 | 上游 200 后未产出任何实质内容 chunk（content/reasoning/tool_calls/finish_reason 均无）即关闭 → 判 `failed`（`error_kind=upstream`）而非 success，避免故障被当成成功；首个实质内容 chunk 到达前的数据行仅缓冲不输出，零输出时缓冲整体丢弃，保持「未写出实质数据」状态可换号重试（对齐 PHP 通道同款修复） |
+| 零输出判定 | 上游 200 后未产出任何实质内容 chunk（content/reasoning/tool_calls/finish_reason 均无）即关闭 → 判 `failed`（`error_kind=upstream`）而非 success，避免故障被当成成功；首个实质内容 chunk 到达前的数据行仅缓冲不输出，零输出时缓冲整体丢弃，保持「未写出实质数据」状态可换号重试（对齐 PHP 通道同款修复）；`error_message` 附诊断后缀（上游 `Content-Type` + 零输出时行缓冲保留的上游原始响应片段，转义换行/制表符后截断 200 字节），用于区分「上游真空流」与「上游返回非 SSE 格式被误判」，仅作证据留存、不参与判定与重试决策 |
+| 响应工具调用剔除 | 决策响应含 `strip_tool_names`（非空）时，Go 在流式增量、非流式聚合（`chat.completion` JSON）、非流式完整 JSON 透传三条路径按 `function.name` 剔除命中名单的 tool_call（流式按 tool_call `index` 跟踪 name 分片累积判定）。用于剔除网关注入的入场券工具被上游回显产生的幽灵调用；剔除后无正文/思考内容时判 `failed`（`error_kind=upstream`）并换号重试（等价零输出语义）。**缺省/空名单完全等价历史行为，既有接入方零感知** |
 | 非标准字段过滤 | 对 SSE 数据行剔除非标准字段（顶层 `provider`/`native_finish_reason`/`service_tier` 与 choices 内 `native_finish_reason`，对齐 PHP 通道 sanitizeChunk），避免严格客户端报 `error decoding response body`；仅含非标准字段的行才经 map 重组，干净行原始字节透传（delta 空对象与字段顺序完全保真）；`delta.reasoning`/`delta.reasoning_details`（思考过程）保留 |
 | 错误 chunk 兼容格式 | 错误以 SSE data 行下发且同时携带 `choices`（空 delta + finish_reason stop）——部分严格客户端（Cline SDK / Rust serde 等）解析每个 data: 行要求 choices 存在，仅有 error 会解码失败（对齐 PHP 通道 formatSseError） |
 | 非 2xx 响应体 | 上游错误响应体（JSON）作为 `error_message` 回传给 PHP 日志接口，供账号维护判定 |
-| 客户端中断 | 客户端断开时停止转发、通知上游关闭，回调 `status=interrupted`、`error_kind=client`；中断文案携带中断时机辅助排查：有 usage 时为「客户端中断（输出 Xs 后取消，已产出约 N tokens）」，无 usage 但已见实质内容时为「客户端中断（输出 Xs 后取消）」，首字节前中断保持「客户端中断」 |
+| 客户端中断 | 客户端断开时停止转发、通知上游关闭，回调 `status=interrupted`、`error_kind=client`；中断文案携带中断时机辅助排查：有 usage 时为「客户端中断（输出 Xs 后取消，已产出约 N tokens）」，无 usage 但已见实质内容时为「客户端中断（输出 Xs 后取消）」，首字节前中断保持「客户端中断」。**流完成凭据是 `data: [DONE]`**：该标记成功写出客户端后即视为流完整结束，此后连接断开（即使上游 FIN 尚在公网 RTT 途中、数据通道未关闭）也判 `success` 而非 `interrupted`——客户端收完结束标记立即关闭连接属正常收尾 |
 | 决策重试 | 决策接口 5xx/网络失败时 Go 短暂退避后重试（最多 3 次）；4xx 业务失败直接向客户端返回错误 |
 | 连接层失败重试退避 | 连接层失败（`error_kind=connect`，如 EOF/拒连）多为上游网关秒级~分钟级抖动窗口，换号重试前按指数退避（2s/4s/8s 封顶），配合 max_retries=3 总退避 14s 提高穿越概率，也降低高频建连触发上游风控的风险；退避期间客户端中断提前收尾；429 仍为固定喘息 1s，timeout 类失败不退避（换号本身有效且等待已长） |
 
@@ -253,3 +259,9 @@ curl -N -X POST http://127.0.0.1:9501/open/llm/cline/v1/chat/completions ^
 | 1.1.8 | 2026-09-20 | 429 无感切换对齐 PHP 通道：换号重试前对每次失败尝试**同步回调** `log-callback`（应用侧即时归因冷却，后续请求不再撞刚失败的账号/出口）；429 重试前固定喘息 1s（分钟级限流窗口内立即重试必然再撞）；429 错误消息语义化注解（TPM/RPM 归类 + 恢复指引，对齐 annotateRateLimitMessage） |
 | 1.1.9 | 2026-09-24 | 中断日志文案增强：`interrupted` 回调的 `error_message` 携带中断时机——有 usage 时「客户端中断（输出 Xs 后取消，已产出约 N tokens）」、无 usage 但已见实质内容时「客户端中断（输出 Xs 后取消）」、首字节前保持「客户端中断」，中断日志占比高（客户端取消为主）时无需逐条点详情即可判断中断时机与损失 |
 | 1.1.10 | 2026-09-24 | 连接层失败重试退避：`error_kind=connect` 换号重试前加指数退避（2s/4s/8s 封顶）。根因：上游网关存在秒级~分钟级抖动窗口（实测 20s 窗口内 4 轮立即重试全灭、窗口期间仍有零星成功、窗口外四象限对照全通），立即换号重试全部撞在窗口内穷尽失败。退避提高穿越概率，也降低高频建连触发上游风控的风险。仅 connect 类退避，429 维持固定 1s，timeout 类不退避 |
+| 1.1.11 | 2026-10-14 | 修复成功响应被误记为「客户端中断」：SSE 行扫描器新增识别 `data: [DONE]` 结束标记（`scanResult.done`，与 usage 行合并时不丢失），主循环在标记成功写出客户端后置 `sawDone`，此后连接断开即判 `success`。根因：原实现唯一的 success 出口依赖上游关闭流，而客户端收完 `[DONE]` 立即断开与远端 FIN 到达之间存在公网 RTT 窗口，窗口内 `select` 只能命中 `ctx.Done()`（实测探针 30/30 误判为 interrupted，修复后 12/12 正确）；`sawDone` 与 `sawContent` 双条件守卫，零输出场景仍判 failed。附带收益：不再空等上游 FIN，请求立即收尾 |
+| 1.1.12 | 2026-10-18 | 零输出诊断取证：`failed`（`error_kind=upstream`，文案「上游零输出（连接建立后未返回任何实质内容）」）的 `error_message` 追加诊断后缀——上游 `Content-Type` 与零输出时行缓冲中完整保留的上游原始响应片段（换行/制表符转空格、截断 200 字节）。用于区分「上游真空流」与「上游返回非 SSE 格式被误判」，仅作证据留存，判定与重试逻辑完全不变（注：该结论已被 1.1.16 修正——上游以 HTTP 200 + SSE `event: error` 下发的账号级故障不再判「上游零输出」，改按错误载荷归因换号） |
+| 1.1.13 | 2026-10-18 | 响应转换契约与入口 BOM 容错：决策响应新增 `response_transform`/`response_transform_model` 字段（取值 `responses_to_chat`：上游 Responses SSE 实时回转为 Chat Completions SSE，流式逐事件转换、非流式聚合为 `chat.completion`，chunk `model` 回写决策下发值）——仅提供 Responses API 的上游（如 Codex），其 Chat Completions 客户端经决策层请求转换（`body_override`）+ Go 侧响应回转接入 Go 通道，不再只能走 PHP 通道；入口剥离客户端请求体 UTF-8 BOM（不剥离会致决策请求构造失败、静默发出空决策 body，决策端报出误导性的「messages 参数不能为空」）；客户端请求体非法 JSON 时向客户端显式报错，不再静默发送空决策请求体。Go 二进制同步编译为 1.0.7（36 用例回归通过，chat/completions 走 Go 通道流式/非流式/BOM 容错端到端验证通过） |
+| 1.1.14 | 2026-10-20 | 决策响应新增 `strip_tool_names` 字段（**可选**，字符串数组）：非空时 Go 在流式增量、非流式聚合、非流式完整 JSON 透传三条响应路径按 `function.name` 剔除命中名单的 tool_call（流式按 tool_call `index` 跟踪 name 分片累积判定），剔除后无正文/思考内容时判 `failed`（可换号重试）。用途：剔除网关注入的「入场券工具」（为通过上游 FreeTier 校验注入的 `read`）被上游回显时产生的幽灵调用，避免客户端收到未声明工具而误执行。**缺省/空名单完全等价历史行为，既有接入方零感知（向后兼容）**。Go 二进制同步升为 1.0.8（新增 8 用例覆盖流式/非流式/完整 JSON 剔除、空名单零改动、幽灵调用触发换号重试、分片累积，全量回归通过） |
+| 1.1.15 | 2026-10-20 | 402 无感切换修复：402（额度/积分不足）纳入换号重试集（此前仅 429/401/403/5xx 可重试，多 Key 场景遇 402 直接终止，未平滑切换）；402 的 `error_kind` 由 `upstream` 改归 `quota`，与 429/401/403 同属「单 Key 语义」——中间尝试同步回调用 `quota` 归因（应用侧据此做 Key/池级冷却），未向客户端写出实质数据前换号重试。新增 `TestRelayRetryOn402` 回归多 Key 场景 402 直接停止的缺陷 |
+| 1.1.16 | 2026-10-20 | 上游流内错误无感切换修复：部分上游（如华为 DevEco）的账号级故障以 **HTTP 200 + SSE `event: error`** 下发，真实状态码只在错误载荷的 `code` 字段（字符串，如 `"403"`）。此前该数据行不含任何实质内容 needle，被当「无内容普通行」忽略，最终误判「上游零输出」（`error_kind=upstream`：不冷却、不退避、丢失真实文案、`http_code` 为空），换号能力完全失效。现新增 SSE 错误事件识别（`parseSSEErrorLine`/`parseSSEErrorData` → `scanResult.streamErr`），流式在未向客户端写出实质内容前按载荷归因换号重试（`streamErrorResult`），已写出则按真实归因判 `failed`；非流式聚合同步识别（`sseAggregator.streamErr`），不再产出空内容成功响应；`errKind` 归类以**类型语义优先**（`streamErrKind`：`ModelServiceRateLimit` 等限流类型归 `rate_limit` 冷却 60s，不按字面 403 归 `auth` 300s，避免小账号池被长冷却耗尽）；`annotateRateLimitMessage` 新增 ModelServiceRateLimit 语义注解。Go 二进制同步升为 1.0.9（新增 5 用例覆盖流内错误识别/归因/换号/聚合/文案注解，llmrelay 全量 49 用例回归通过） |
