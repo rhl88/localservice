@@ -21,9 +21,13 @@
         .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
         .status-dot.running { background: #52c41a; box-shadow: 0 0 6px rgba(82,196,26,0.5); }
         .status-dot.stopped { background: #ff4d4f; box-shadow: 0 0 6px rgba(255,77,79,0.5); }
+        .status-dot.notinstalled { background: #bbb; }
         .status-text { font-size: 16px; font-weight: 600; }
         .status-text.running { color: #52c41a; }
         .status-text.stopped { color: #ff4d4f; }
+        .status-text.notinstalled { color: #999; }
+        .install-guide { margin-top: 12px; padding: 10px 12px; background: #fffbe6; border: 1px solid #ffe58f; border-radius: 4px; font-size: 13px; color: #d46b08; line-height: 1.8; display: none; }
+        .install-guide a { color: #1e9fff; text-decoration: underline; }
         .version-info { margin-top: 10px; font-size: 13px; color: #666; }
         .version-info span { color: #333; font-weight: 500; }
         .quick-actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
@@ -61,6 +65,11 @@
                     <button class="layui-btn layui-btn-sm layui-btn-primary" id="btnStart"><i class="fa fa-play"></i> 启动</button>
                     <button class="layui-btn layui-btn-sm layui-btn-primary" id="btnStop"><i class="fa fa-stop"></i> 停止</button>
                     <button class="layui-btn layui-btn-sm" id="btnRefresh"><i class="fa fa-refresh"></i> 刷新</button>
+                </div>
+                <div class="install-guide" id="installGuide">
+                    <i class="fa fa-info-circle"></i> 本地服务尚未安装。请前往
+                    <a href="/admin/cmspro/localservice/settings">设置页面</a>
+                    点击「生成安装脚本」，并按页面提示以管理员（Windows）或 root（Linux）权限运行脚本完成安装。
                 </div>
                 <div class="path-tip" id="pathTip"></div>
             </div>
@@ -128,6 +137,8 @@ layui.use(['table', 'layer', 'jquery'], function(){
     var pollTimer = null;
     var currentStatus = null;
     var appMap = {};
+    // 最近任务表格渲染状态：'online'=已拉取任务数据 / 'offline'=已渲染空表格，状态切换时重新渲染
+    var lastTasksState = null;
 
     // 加载已安装应用映射
     $.ajax({
@@ -177,15 +188,25 @@ layui.use(['table', 'layer', 'jquery'], function(){
 
                 var dot = $('#statusDot');
                 var txt = $('#statusText');
+                $('#installGuide').hide();
+                $('#pathTip').hide();
                 if (online) {
-                    dot.removeClass('stopped').addClass('running');
-                    txt.removeClass('stopped').addClass('running').text('运行中');
+                    dot.removeClass('stopped notinstalled').addClass('running');
+                    txt.removeClass('stopped notinstalled').addClass('running').text('运行中');
                     $('#btnStart').prop('disabled', true).addClass('layui-btn-disabled');
                     $('#btnRestart').prop('disabled', false).removeClass('layui-btn-disabled');
                     $('#btnStop').prop('disabled', false).removeClass('layui-btn-disabled');
+                } else if (!svc.binary_exists) {
+                    // 未安装：二进制不存在，引导到设置页面生成安装脚本
+                    dot.removeClass('running stopped').addClass('notinstalled');
+                    txt.removeClass('running stopped').addClass('notinstalled').text('未安装');
+                    $('#btnStart').prop('disabled', true).addClass('layui-btn-disabled');
+                    $('#btnRestart').prop('disabled', true).addClass('layui-btn-disabled');
+                    $('#btnStop').prop('disabled', true).addClass('layui-btn-disabled');
+                    $('#installGuide').show();
                 } else {
-                    dot.removeClass('running').addClass('stopped');
-                    txt.removeClass('running').addClass('stopped').text('已停止');
+                    dot.removeClass('running notinstalled').addClass('stopped');
+                    txt.removeClass('running notinstalled').addClass('stopped').text('已停止');
                     $('#btnStart').prop('disabled', false).removeClass('layui-btn-disabled');
                     $('#btnRestart').prop('disabled', true).addClass('layui-btn-disabled');
                     $('#btnStop').prop('disabled', true).addClass('layui-btn-disabled');
@@ -197,6 +218,17 @@ layui.use(['table', 'layer', 'jquery'], function(){
                     $('#statsSuccess').text(d.stats.success || 0);
                     $('#statsRate').text((d.stats.success_rate || 0) + '%');
                 }
+
+                // 最近任务数据存于 Go 服务端：上线后拉取，离线/未安装时渲染空表格（状态变化时）
+                if (online) {
+                    if (lastTasksState !== 'online') {
+                        lastTasksState = 'online';
+                        loadRecentTasks();
+                    }
+                } else if (lastTasksState !== 'offline') {
+                    lastTasksState = 'offline';
+                    renderRecentTable([]);
+                }
             },
             error: function() {
                 layer.msg('请求服务状态失败', {icon: 2, time: 2000});
@@ -204,8 +236,36 @@ layui.use(['table', 'layer', 'jquery'], function(){
         });
     }
 
+    // 最近任务表格列配置（在线拉取与离线空表格共用）
+    var recentCols = [[
+        {field: 'id', title: 'ID'},
+        {field: 'app_id', title: '应用', templet: function(d) { return appMap[d.app_id] || d.app_id; }},
+        {field: 'type', title: '类型'},
+        {field: 'mode', title: '模式'},
+        {field: 'status', title: '状态', templet: '#taskStatusTpl'},
+        {field: 'duration_ms', title: '耗时(ms)'},
+        {field: 'create_time', title: '创建时间', templet: function(d) { return formatTime(d.create_time); }}
+    ]];
+
+    // 渲染最近任务表格
+    function renderRecentTable(items) {
+        table.render({
+            elem: '#recentTable',
+            data: items,
+            cols: recentCols,
+            page: false,
+            limit: 5
+        });
+    }
+
     // 加载最近任务表格
     function loadRecentTasks() {
+        // 任务数据存于 Go 服务端，服务离线/未安装时无法获取，直接渲染空表格
+        if (currentStatus && !currentStatus.online) {
+            lastTasksState = 'offline';
+            renderRecentTable([]);
+            return;
+        }
         $.ajax({
             url: API + '/tasks',
             type: 'GET',
@@ -217,22 +277,7 @@ layui.use(['table', 'layer', 'jquery'], function(){
                     return;
                 }
                 var d = res.data;
-                var items = d.items || [];
-                table.render({
-                    elem: '#recentTable',
-                    data: items,
-                    cols: [[
-                        {field: 'id', title: 'ID'},
-                        {field: 'app_id', title: '应用', templet: function(d) { return appMap[d.app_id] || d.app_id; }},
-                        {field: 'type', title: '类型'},
-                        {field: 'mode', title: '模式'},
-                        {field: 'status', title: '状态', templet: '#taskStatusTpl'},
-                        {field: 'duration_ms', title: '耗时(ms)'},
-                        {field: 'create_time', title: '创建时间', templet: function(d) { return formatTime(d.create_time); }}
-                    ]],
-                    page: false,
-                    limit: 5
-                });
+                renderRecentTable(d.items || []);
             },
             error: function() {
                 layer.msg('获取最近任务失败', {icon: 2, time: 2000});
@@ -608,9 +653,8 @@ layui.use(['table', 'layer', 'jquery'], function(){
         }
     });
 
-    // 初始化
+    // 初始化（最近任务由 loadStatus 回调按服务在线状态驱动加载）
     loadStatus();
-    loadRecentTasks();
     startPoll();
     checkUpdate();
 });

@@ -66,11 +66,14 @@ class LocalServiceClient
 
     /**
      * 服务是否在线（HTTP 可达且 code=0）。
+     *
+     * @param int $timeout 单次探测超时（秒），0 表示使用全局配置。
+     *                     重启后轮询确认等场景建议传短超时，避免探测阻塞拖长请求总时长。
      */
-    public function isOnline(): bool
+    public function isOnline(int $timeout = 0): bool
     {
         try {
-            $res = $this->status();
+            $res = $this->request('GET', '/api/status', [], $timeout > 0 ? $timeout : null);
             return ($res['code'] ?? -1) === 0;
         } catch (\Throwable $e) {
             return false;

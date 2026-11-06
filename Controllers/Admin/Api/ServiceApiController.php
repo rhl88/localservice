@@ -185,6 +185,14 @@ class ServiceApiController
     }
 
     /**
+     * 服务管理命令清单（PHP 禁用 exec/shell_exec 或权限不足时，供用户在服务器手动执行）。
+     */
+    public function commands()
+    {
+        return ApiResponse::success($this->manager->serviceCommands());
+    }
+
+    /**
      * 已安装应用列表（app_id → name 映射，供前端显示用）。
      */
     public function installedApps()
