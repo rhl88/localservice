@@ -6,3 +6,11 @@
 
 # 本地服务运行时配置（含本机生成的 auth_token，由 syncConfig 自动维护）
 Bin/storage/local_service_config.json
+
+# 本地服务运行时数据库（任务/日志/拓展数据，由 Go 服务运行时自动生成）
+Bin/storage/*.db
+
+# 编译备份与临时副本
+*.exe.bak-*
+*.exe~
+*.ps1.txt
